@@ -297,3 +297,55 @@ index 0ce4748..cc381ad 100644
  # CONFIG_ARM64_PTDUMP is not set
  # CONFIG_PID_IN_CONTEXTIDR is not set
  # CONFIG_ARM64_RANDOMIZE_TEXT_OFFSET is not set
+diff --git a/debian/build/build_amd64_none_amd64/.config b/debian/build/build_amd64_none_amd64/.config
+index 9851a0c..0f1389f 100644
+--- a/debian/build/build_amd64_none_amd64/.config
++++ b/debian/build/build_amd64_none_amd64/.config
+@@ -2745,6 +2744,7 @@ CONFIG_NET_VENDOR_WIZNET=y
+ # CONFIG_WIZNET_W5300 is not set
+ CONFIG_NET_VENDOR_XIRCOM=y
+ CONFIG_PCMCIA_XIRC2PS=m
++# CONFIG_NET_VENDOR_CENTEC is not set
+ CONFIG_FDDI=y
+ CONFIG_DEFXX=m
+ # CONFIG_DEFXX_MMIO is not set
+@@ -3622,6 +3622,7 @@ CONFIG_I2C_SCMI=m
+ # CONFIG_I2C_CBUS_GPIO is not set
+ CONFIG_I2C_DESIGNWARE_CORE=m
+ CONFIG_I2C_DESIGNWARE_PLATFORM=m
++# CONFIG_I2C_CENTEC is not set
+ CONFIG_I2C_DESIGNWARE_PCI=m
+ # CONFIG_I2C_DESIGNWARE_BAYTRAIL is not set
+ # CONFIG_I2C_EMEV2 is not set
+@@ -3676,6 +3677,7 @@ CONFIG_SPI_LM70_LLP=m
+ # CONFIG_SPI_XCOMM is not set
+ # CONFIG_SPI_XILINX is not set
+ # CONFIG_SPI_ZYNQMP_GQSPI is not set
++# CONFIG_SPI_CENTEC_QSPI is not set
+ 
+ #
+ # SPI Protocol Masters
+@@ -3739,6 +3741,7 @@ CONFIG_GPIO_GENERIC=m
+ #
+ CONFIG_GPIO_AMDPT=m
+ # CONFIG_GPIO_DWAPB is not set
++# CONFIG_GPIO_CTC is not set
+ # CONFIG_GPIO_GENERIC_PLATFORM is not set
+ CONFIG_GPIO_ICH=m
+ # CONFIG_GPIO_LYNXPOINT is not set
+@@ -5582,6 +5586,7 @@ CONFIG_USB_EHCI_ROOT_HUB_TT=y
+ CONFIG_USB_EHCI_TT_NEWSCHED=y
+ CONFIG_USB_EHCI_PCI=m
+ # CONFIG_USB_EHCI_HCD_PLATFORM is not set
++# CONFIG_USB_EHCI_CTC is not set
+ # CONFIG_USB_OXU210HP_HCD is not set
+ # CONFIG_USB_ISP116X_HCD is not set
+ # CONFIG_USB_ISP1362_HCD is not set
+@@ -6066,6 +6071,7 @@ CONFIG_RTC_INTF_DEV=y
+ # CONFIG_RTC_DRV_RX8025 is not set
+ # CONFIG_RTC_DRV_EM3027 is not set
+ # CONFIG_RTC_DRV_RV8803 is not set
++# CONFIG_RTC_DRV_SD2405 is not set
+ 
+ #
+ # SPI RTC drivers
