@@ -132,6 +132,7 @@ centec_tsingma_soc_qspi.patch
 centec_tsingma_soc_rtc.patch
 centec_tsingma_soc_usb_host.patch
 centec_tsingma_soc_watchdog.patch
+centec_tsingma_soc_emmc_bugfix_20200327.patch
 #
 # This series applies on GIT commit 1451b36b2b0d62178e42f648d8a18131af18f7d8
 # Tkernel-sched-core-fix-cgroup-fork-race.patch
