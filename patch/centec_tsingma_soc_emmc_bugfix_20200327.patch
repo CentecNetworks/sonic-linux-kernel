@@ -1,0 +1,261 @@
+diff --git a/drivers/mmc/host/sdhci-ctc5236.c b/drivers/mmc/host/sdhci-ctc5236.c
+index 362fd97..e9aee08 100644
+--- a/drivers/mmc/host/sdhci-ctc5236.c
++++ b/drivers/mmc/host/sdhci-ctc5236.c
+@@ -29,6 +29,8 @@
+ #include <linux/delay.h>   
+ #include <linux/raid/pq.h>  
+ #include <soc/ctc/ctc5236_switch.h>
++#include <linux/sizes.h>
++#include <linux/dma-mapping.h>
+ 
+ #define REG_OFFSET_ADDR 0x500
+ #define MSHC_CTRL_R 0x8
+@@ -51,6 +53,9 @@ static bool support_vsel = false;
+ #define CTC_Phase180_100M	0x3A
+ #define CTC_Phase180_150M	0x18
+ 
++#define BOUNDARY_OK(addr, len) \
++	((addr | (SZ_128M - 1)) == ((addr + len - 1) | (SZ_128M - 1)))
++	
+ static u16 sdhci_ctc5236_readw(struct sdhci_host *host, int reg)
+ {
+ 	if (unlikely(reg == SDHCI_HOST_VERSION)) {
+@@ -239,6 +244,29 @@ static void sdhci_ctc5236_voltage_switch(struct sdhci_host *host)
+ 	}
+ }
+ 
++/*
++ * If DMA addr spans 128MB boundary, we split the DMA transfer into two
++ * so that each DMA transfer doesn't exceed the boundary.
++ */
++static void sdhci_ctc5236_adma_write_desc(struct sdhci_host *host, void **desc, 
++							dma_addr_t addr, int len, unsigned int cmd)
++{
++	int tmplen, offset;
++
++	if (likely(!len || BOUNDARY_OK(addr, len))) {
++		sdhci_adma_write_desc(host, desc, addr, len, cmd);
++		return;
++	}
++
++	offset = addr & (SZ_128M - 1);
++	tmplen = SZ_128M - offset;
++	sdhci_adma_write_desc(host, desc, addr, tmplen, cmd);
++
++	addr += tmplen;
++	len -= tmplen;
++	sdhci_adma_write_desc(host, desc, addr, len, cmd);
++}
++
+ static const struct sdhci_ops sdhci_ctc5236_ops = {
+ 	.read_w = sdhci_ctc5236_readw,
+ 	.read_l	= sdhci_ctc5236_readl,
+@@ -249,6 +277,7 @@ static const struct sdhci_ops sdhci_ctc5236_ops = {
+ 	.get_max_clock = sdhci_pltfm_clk_get_max_clock,
+ 	.platform_execute_tuning = sdhci_ctc5236_execute_tuning,
+ 	.voltage_switch = sdhci_ctc5236_voltage_switch,
++	.adma_write_desc = sdhci_ctc5236_adma_write_desc,
+ };
+ 
+ static struct sdhci_pltfm_data sdhci_ctc5236_pdata = {
+@@ -290,10 +319,19 @@ static int sdhci_ctc5236_probe(struct platform_device *pdev)
+ 	struct sdhci_pltfm_host *pltfm_host;
+ 	struct clk *clk;
+ 	int ret;	
++	u32 extra;
+ 	
+ 	host = sdhci_pltfm_init(pdev, &sdhci_ctc5236_pdata, 0);
+ 	if (IS_ERR(host))
+ 		return PTR_ERR(host);
++
++        /*
++         * extra adma table cnt for cross 128M boundary handling.
++         */
++        extra = DIV_ROUND_UP_ULL(dma_get_required_mask(&pdev->dev), SZ_128M);
++        if (extra > SDHCI_MAX_SEGS)
++                extra = SDHCI_MAX_SEGS;
++        host->adma_table_cnt += extra;
+ 	
+ 	clk =  devm_clk_get(&pdev->dev, "mmc_clk");
+ 	if (IS_ERR(clk)) {
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index df306ca..5fc32aa 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -508,6 +508,34 @@ static void sdhci_kunmap_atomic(void *buffer, unsigned long *flags)
+ 	local_irq_restore(*flags);
+ }
+ 
++#ifdef CONFIG_ARCH_CTC5236			
++void sdhci_adma_write_desc(struct sdhci_host *host, void **desc,
++			   dma_addr_t addr, int len, unsigned int cmd)
++{
++	struct sdhci_adma2_64_desc *dma_desc = *desc;
++
++	/* 32-bit and 64-bit descriptors have these members in same position */
++	dma_desc->cmd = cpu_to_le16(cmd);
++	dma_desc->len = cpu_to_le16(len);
++	dma_desc->addr_lo = cpu_to_le32(lower_32_bits(addr));
++
++	if (host->flags & SDHCI_USE_64_BIT_DMA)
++		dma_desc->addr_hi = cpu_to_le32(upper_32_bits(addr));
++
++	*desc += host->desc_sz;
++}
++EXPORT_SYMBOL_GPL(sdhci_adma_write_desc);
++
++static inline void __sdhci_adma_write_desc(struct sdhci_host *host,
++					   void **desc, dma_addr_t addr,
++					   int len, unsigned int cmd)
++{
++	if (host->ops->adma_write_desc)
++		host->ops->adma_write_desc(host, desc, addr, len, cmd);
++	else
++		sdhci_adma_write_desc(host, desc, addr, len, cmd);
++}
++#else
+ static void sdhci_adma_write_desc(struct sdhci_host *host, void *desc,
+ 				  dma_addr_t addr, int len, unsigned cmd)
+ {
+@@ -522,6 +550,8 @@ static void sdhci_adma_write_desc(struct sdhci_host *host, void *desc,
+ 		dma_desc->addr_hi = cpu_to_le32((u64)addr >> 32);
+ }
+ 
++#endif
++
+ static void sdhci_adma_mark_end(void *desc)
+ {
+ 	struct sdhci_adma2_64_desc *dma_desc = desc;
+@@ -572,6 +602,15 @@ static void sdhci_adma_table_pre(struct sdhci_host *host,
+ 			}
+ 
+ 			/* tran, valid */
++#ifdef CONFIG_ARCH_CTC5236
++			__sdhci_adma_write_desc(host, &desc, align_addr,
++						offset, ADMA2_TRAN_VALID);
++
++			BUG_ON(offset > 65536);
++
++			align += SDHCI_ADMA2_ALIGN;
++			align_addr += SDHCI_ADMA2_ALIGN;
++#else
+ 			sdhci_adma_write_desc(host, desc, align_addr, offset,
+ 					      ADMA2_TRAN_VALID);
+ 
+@@ -581,7 +620,7 @@ static void sdhci_adma_table_pre(struct sdhci_host *host,
+ 			align_addr += SDHCI_ADMA2_ALIGN;
+ 
+ 			desc += host->desc_sz;
+-
++#endif
+ 			addr += offset;
+ 			len -= offset;
+ 		}
+@@ -590,9 +629,14 @@ static void sdhci_adma_table_pre(struct sdhci_host *host,
+ 
+ 		if (len) {
+ 			/* tran, valid */
++#ifdef CONFIG_ARCH_CTC5236			
++			__sdhci_adma_write_desc(host, &desc, addr, len,
++						ADMA2_TRAN_VALID);
++#else
+ 			sdhci_adma_write_desc(host, desc, addr, len,
+ 					      ADMA2_TRAN_VALID);
+ 			desc += host->desc_sz;
++#endif			
+ 		}
+ 
+ 		/*
+@@ -610,7 +654,11 @@ static void sdhci_adma_table_pre(struct sdhci_host *host,
+ 		}
+ 	} else {
+ 		/* Add a terminating entry - nop, end, valid */
++#ifdef CONFIG_ARCH_CTC5236			
++		__sdhci_adma_write_desc(host, &desc, 0, 0, ADMA2_NOP_END_VALID);
++#else
+ 		sdhci_adma_write_desc(host, desc, 0, 0, ADMA2_NOP_END_VALID);
++#endif
+ 	}
+ }
+ 
+@@ -2994,6 +3042,14 @@ struct sdhci_host *sdhci_alloc_host(struct device *dev,
+ 
+ 	host->flags = SDHCI_SIGNALING_330;
+ 
++#ifdef CONFIG_ARCH_CTC5236	
++	/*
++	 * The DMA table descriptor count is calculated as the maximum
++	 * number of segments times 2, to allow for an alignment
++	 * descriptor for each segment, plus 1 for a nop end descriptor.
++	 */
++	host->adma_table_cnt = SDHCI_MAX_SEGS * 2 + 1;
++#endif	
+ 	return host;
+ }
+ 
+@@ -3150,7 +3206,17 @@ int sdhci_setup_host(struct sdhci_host *host)
+ 	if (host->flags & SDHCI_USE_ADMA) {
+ 		dma_addr_t dma;
+ 		void *buf;
+-
++#ifdef CONFIG_ARCH_CTC5236	
++		if (host->flags & SDHCI_USE_64_BIT_DMA) {
++			host->adma_table_sz = host->adma_table_cnt *
++					      SDHCI_ADMA2_64_DESC_SZ;
++			host->desc_sz = SDHCI_ADMA2_64_DESC_SZ;
++		} else {
++			host->adma_table_sz = host->adma_table_cnt *
++					      SDHCI_ADMA2_32_DESC_SZ;
++			host->desc_sz = SDHCI_ADMA2_32_DESC_SZ;
++		}
++#else
+ 		/*
+ 		 * The DMA descriptor table size is calculated as the maximum
+ 		 * number of segments times 2, to allow for an alignment
+@@ -3166,7 +3232,7 @@ int sdhci_setup_host(struct sdhci_host *host)
+ 					      SDHCI_ADMA2_32_DESC_SZ;
+ 			host->desc_sz = SDHCI_ADMA2_32_DESC_SZ;
+ 		}
+-
++#endif
+ 		host->align_buffer_sz = SDHCI_MAX_SEGS * SDHCI_ADMA2_ALIGN;
+ 		buf = dma_alloc_coherent(mmc_dev(mmc), host->align_buffer_sz +
+ 					 host->adma_table_sz, &dma, GFP_KERNEL);
+diff --git a/drivers/mmc/host/sdhci.h b/drivers/mmc/host/sdhci.h
+index 2570455..2bf1800 100644
+--- a/drivers/mmc/host/sdhci.h
++++ b/drivers/mmc/host/sdhci.h
+@@ -524,7 +524,10 @@ struct sdhci_host {
+ #define SDHCI_TUNING_MODE_1	0
+ #define SDHCI_TUNING_MODE_2	1
+ #define SDHCI_TUNING_MODE_3	2
+-
++#ifdef CONFIG_ARCH_CTC5236
++	/* Host ADMA table count */
++	u32			adma_table_cnt;
++#endif
+ 	unsigned long private[0] ____cacheline_aligned;
+ };
+ 
+@@ -564,6 +567,10 @@ struct sdhci_ops {
+ 					 struct mmc_card *card,
+ 					 unsigned int max_dtr, int host_drv,
+ 					 int card_drv, int *drv_type);
++#ifdef CONFIG_ARCH_CTC5236	
++	void	(*adma_write_desc)(struct sdhci_host *host, void **desc,
++				   dma_addr_t addr, int len, unsigned int cmd);
++#endif
+ };
+ 
+ #ifdef CONFIG_MMC_SDHCI_IO_ACCESSORS
+@@ -698,4 +705,9 @@ extern int sdhci_runtime_suspend_host(struct sdhci_host *host);
+ extern int sdhci_runtime_resume_host(struct sdhci_host *host);
+ #endif
+ 
++#ifdef CONFIG_ARCH_CTC5236	
++void sdhci_adma_write_desc(struct sdhci_host *host, void **desc,
++			   dma_addr_t addr, int len, unsigned int cmd);
++#endif
++
+ #endif /* __SDHCI_HW_H */
