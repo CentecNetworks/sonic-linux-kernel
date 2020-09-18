@@ -124,6 +124,7 @@ Support-for-fullcone-nat.patch
 driver-ixgbe-external-phy.patch
 fix_ismt_alignment_issue.patch
 net-psample-module-unload.patch
+0001-support-arm64-kexec.patch
 centec_tsingma_soc_config.patch
 centec_tsingma_soc_ethernet.patch
 centec_tsingma_soc_gpio.patch

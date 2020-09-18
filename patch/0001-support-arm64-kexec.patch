@@ -1,0 +1,253 @@
+From a5fd6c5b2048b4fca5148575d4d47409b47e69c6 Mon Sep 17 00:00:00 2001
+From: shil <shil@centecnetworks.com>
+Date: Thu, 30 Jul 2020 21:57:23 +0800
+Subject: [PATCH] support arm64 kexec
+
+---
+ arch/arm64/include/asm/virt.h               |  6 ++-
+ arch/arm64/kernel/Makefile                  |  3 +-
+ arch/arm64/kernel/cpu-park.S                | 56 +++++++++++++++++++++
+ arch/arm64/kernel/cpu-park.h                | 29 +++++++++++
+ arch/arm64/kernel/smp_spin_table.c          | 46 ++++++++++++++---
+ debian/build/build_arm64_none_arm64/.config |  1 +
+ 6 files changed, 131 insertions(+), 10 deletions(-)
+ create mode 100644 arch/arm64/kernel/cpu-park.S
+ create mode 100644 arch/arm64/kernel/cpu-park.h
+
+diff --git a/arch/arm64/include/asm/virt.h b/arch/arm64/include/asm/virt.h
+index fea1073..981c004 100644
+--- a/arch/arm64/include/asm/virt.h
++++ b/arch/arm64/include/asm/virt.h
+@@ -64,7 +64,9 @@ phys_addr_t __hyp_get_vectors(void);
+ 
+ /* Reports the availability of HYP mode */
+ static inline bool is_hyp_mode_available(void)
+-{
++{	
++	printk("CTC_DEBUG. %s: __boot_cpu_mode[0] is %x, __boot_cpu_mode[1] is %x\n", 
++		__func__, __boot_cpu_mode[0], __boot_cpu_mode[1]);
+ 	return (__boot_cpu_mode[0] == BOOT_CPU_MODE_EL2 &&
+ 		__boot_cpu_mode[1] == BOOT_CPU_MODE_EL2);
+ }
+@@ -72,6 +74,8 @@ static inline bool is_hyp_mode_available(void)
+ /* Check if the bootloader has booted CPUs in different modes */
+ static inline bool is_hyp_mode_mismatched(void)
+ {
++	printk("CTC_DEBUG. %s: __boot_cpu_mode[0] is %x, __boot_cpu_mode[1] is %x\n", 
++		__func__, __boot_cpu_mode[0], __boot_cpu_mode[1]);
+ 	return __boot_cpu_mode[0] != __boot_cpu_mode[1];
+ }
+ 
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 6dadaae..0315012 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -19,7 +19,8 @@ arm64-obj-y		:= debug-monitors.o entry.o irq.o fpsimd.o		\
+ 			   hyp-stub.o psci.o cpu_ops.o insn.o	\
+ 			   return_address.o cpuinfo.o cpu_errata.o		\
+ 			   cpufeature.o alternative.o cacheinfo.o		\
+-			   smp.o smp_spin_table.o topology.o smccc-call.o
++			   smp.o smp_spin_table.o topology.o smccc-call.o  \
++			   cpu-park.o
+ 
+ extra-$(CONFIG_EFI)			:= efi-entry.o
+ 
+diff --git a/arch/arm64/kernel/cpu-park.S b/arch/arm64/kernel/cpu-park.S
+new file mode 100644
+index 0000000..9a68a50
+--- /dev/null
++++ b/arch/arm64/kernel/cpu-park.S
+@@ -0,0 +1,56 @@
++/*
++ * cpu park routines
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/linkage.h>
++#include <asm/assembler.h>
++#include <asm/sysreg.h>
++#include <asm/virt.h>
++
++.text
++.pushsection 	.idmap.text, "ax"
++
++/*
++ * __cpu_park(el2_switch, park_address) - Helper for cpu_park
++ *
++ * @el2_switch: Flag to indicate a swich to EL2 is needed, passed to cpu_park.
++ * @park_address - where cpu will keep on looking for address to jump
++ *
++ * Put the CPU into the wfe and check for valid none zero secondary address
++ * at parked address when a event is received. If secondary address is
++ * valid then jump to it.
++ */
++
++ENTRY(__cpu_park)
++	/* Clear sctlr_el1 flags. */
++	mrs	x12, sctlr_el1
++	ldr	x13, =SCTLR_ELx_FLAGS
++	bic	x12, x12, x13
++	msr	sctlr_el1, x12
++	isb
++	mov	x3, 0
++	str	x3, [x1]
++1:
++	wfe
++	ldr	x2, [x1]
++	cmp	x2, #0
++	b.eq	1b
++
++	mov	x3, 0
++	str	x3, [x1]
++
++	cbz	x0, 2f				// el2_switch?
++
++	mov	x0, x2				// entry
++	hvc	#0			// no return
++
++2:
++	ret	x2
++
++ENDPROC(__cpu_park)
++
++.popsection
+\ No newline at end of file
+diff --git a/arch/arm64/kernel/cpu-park.h b/arch/arm64/kernel/cpu-park.h
+new file mode 100644
+index 0000000..4f012bd
+--- /dev/null
++++ b/arch/arm64/kernel/cpu-park.h
+@@ -0,0 +1,29 @@
++/*
++ * cpu park routines
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#if !defined(_ARM64_CPU_PARK_H)
++#define _ARM64_CPU_PARK_H
++
++#include <asm/virt.h>
++#ifdef CONFIG_CRASH_DUMP
++#include <linux/kexec.h>
++#endif
++
++void __cpu_park(unsigned long el2_switch, unsigned long park_address);
++
++static inline void __noreturn cpu_park(unsigned long el2_switch,
++					unsigned long park_address)
++{
++	typeof(__cpu_park) *park_fn;
++
++	park_fn = (void *)virt_to_phys(__cpu_park);
++	park_fn(el2_switch, park_address);
++	unreachable();
++}
++
++#endif
+diff --git a/arch/arm64/kernel/smp_spin_table.c b/arch/arm64/kernel/smp_spin_table.c
+index 9a00eee..d641975 100644
+--- a/arch/arm64/kernel/smp_spin_table.c
++++ b/arch/arm64/kernel/smp_spin_table.c
+@@ -26,8 +26,12 @@
+ #include <asm/cpu_ops.h>
+ #include <asm/cputype.h>
+ #include <asm/io.h>
++#include <asm/kexec.h>
++#include <asm/mmu_context.h>
+ #include <asm/smp_plat.h>
+ 
++#include "cpu-park.h"
++
+ extern void secondary_holding_pen(void);
+ volatile unsigned long __section(".mmuoff.data.read")
+ secondary_holding_pen_release = INVALID_HWID;
+@@ -75,11 +79,14 @@ static int smp_spin_table_cpu_init(unsigned int cpu)
+ 
+ static int smp_spin_table_cpu_prepare(unsigned int cpu)
+ {
+-	__le64 __iomem *release_addr;
+-
+ 	if (!cpu_release_addr[cpu])
+ 		return -ENODEV;
++	return 0;
++}
+ 
++static int smp_spin_table_cpu_boot(unsigned int cpu)
++{
++	__le64 __iomem *release_addr;
+ 	/*
+ 	 * The cpu-release-addr may or may not be inside the linear mapping.
+ 	 * As ioremap_cache will either give us a new mapping or reuse the
+@@ -108,12 +115,7 @@ static int smp_spin_table_cpu_prepare(unsigned int cpu)
+ 	sev();
+ 
+ 	iounmap(release_addr);
+-
+-	return 0;
+-}
+-
+-static int smp_spin_table_cpu_boot(unsigned int cpu)
+-{
++	
+ 	/*
+ 	 * Update the pen release flag.
+ 	 */
+@@ -127,9 +129,37 @@ static int smp_spin_table_cpu_boot(unsigned int cpu)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_HOTPLUG_CPU
++static int smp_spin_table_cpu_disable(unsigned int cpu)
++{
++	if (!cpu_release_addr[cpu])
++		return -EOPNOTSUPP;
++
++	return 0;
++}
++
++static void smp_spin_table_cpu_die(unsigned int cpu)
++{
++	cpu_install_idmap();
++#ifdef CONFIG_CRASH_DUMP
++	cpu_park(kexec_crash_loaded() ? 0 : is_hyp_mode_available(),
++			cpu_release_addr[cpu]);
++#else
++	cpu_park(is_hyp_mode_available(),
++			cpu_release_addr[cpu]);
++#endif
++
++	pr_crit("unable to power off CPU%u\n", cpu);
++}
++#endif
++
+ const struct cpu_operations smp_spin_table_ops = {
+ 	.name		= "spin-table",
+ 	.cpu_init	= smp_spin_table_cpu_init,
+ 	.cpu_prepare	= smp_spin_table_cpu_prepare,
+ 	.cpu_boot	= smp_spin_table_cpu_boot,
++#ifdef CONFIG_HOTPLUG_CPU
++	.cpu_disable	= smp_spin_table_cpu_disable,
++	.cpu_die	= smp_spin_table_cpu_die,
++#endif
+ };
+diff --git a/debian/build/build_arm64_none_arm64/.config b/debian/build/build_arm64_none_arm64/.config
+index ffb2f49..136f7e1 100644
+--- a/debian/build/build_arm64_none_arm64/.config
++++ b/debian/build/build_arm64_none_arm64/.config
+@@ -6535,6 +6535,7 @@ CONFIG_NTFS_FS=m
+ #
+ CONFIG_PROC_FS=y
+ CONFIG_PROC_KCORE=y
++CONFIG_PROC_VMCORE=y
+ CONFIG_PROC_SYSCTL=y
+ CONFIG_PROC_PAGE_MONITOR=y
+ CONFIG_PROC_CHILDREN=y
+-- 
+2.17.1
+
