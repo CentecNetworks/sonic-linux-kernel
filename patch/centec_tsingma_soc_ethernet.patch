@@ -1,5 +1,5 @@
 diff --git a/drivers/net/ethernet/Kconfig b/drivers/net/ethernet/Kconfig
-index 8cc7467..6e217d7 100644
+index 8cc7467b..6e217d7f 100644
 --- a/drivers/net/ethernet/Kconfig
 +++ b/drivers/net/ethernet/Kconfig
 @@ -179,5 +179,5 @@ source "drivers/net/ethernet/via/Kconfig"
@@ -10,7 +10,7 @@ index 8cc7467..6e217d7 100644
 +source "drivers/net/ethernet/centec/Kconfig"
  endif # ETHERNET
 diff --git a/drivers/net/ethernet/Makefile b/drivers/net/ethernet/Makefile
-index a09423d..fd67870 100644
+index a09423df..fd678701 100644
 --- a/drivers/net/ethernet/Makefile
 +++ b/drivers/net/ethernet/Makefile
 @@ -89,3 +89,4 @@ obj-$(CONFIG_NET_VENDOR_VIA) += via/
@@ -20,7 +20,7 @@ index a09423d..fd67870 100644
 +obj-$(CONFIG_NET_VENDOR_CENTEC) += centec/
 diff --git a/drivers/net/ethernet/centec/Kconfig b/drivers/net/ethernet/centec/Kconfig
 new file mode 100644
-index 0000000..e2c5ffc
+index 00000000..e2c5ffcf
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/Kconfig
 @@ -0,0 +1,10 @@
@@ -36,14 +36,14 @@ index 0000000..e2c5ffc
 +
 diff --git a/drivers/net/ethernet/centec/Makefile b/drivers/net/ethernet/centec/Makefile
 new file mode 100644
-index 0000000..4eb5938
+index 00000000..4eb5938b
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/Makefile
 @@ -0,0 +1 @@
 +obj-$(CONFIG_NET_VENDOR_CENTEC) += ctcmac.o  ctcmac_test.o ctc5236_mdio.o
 diff --git a/drivers/net/ethernet/centec/ctc5236_mdio.c b/drivers/net/ethernet/centec/ctc5236_mdio.c
 new file mode 100644
-index 0000000..8729c0e
+index 00000000..8729c0e3
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctc5236_mdio.c
 @@ -0,0 +1,205 @@
@@ -254,10 +254,10 @@ index 0000000..8729c0e
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/net/ethernet/centec/ctcmac.c b/drivers/net/ethernet/centec/ctcmac.c
 new file mode 100644
-index 0000000..206a542
+index 00000000..96d5bedb
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctcmac.c
-@@ -0,0 +1,2588 @@
+@@ -0,0 +1,2787 @@
 +/*
 + * Centec CpuMac Ethernet Driver -- CpuMac controller implementation
 + * Provides Bus interface for MIIM regs
@@ -301,6 +301,8 @@ index 0000000..206a542
 +#include <linux/regmap.h>
 +#include <linux/mfd/syscon.h>
 +#include <linux/iopoll.h>
++#include <soc/ctc/ctc5236_switch.h>
++
 +#include "ctcmac.h"
 +#include "ctcmac_reg.h"
 +
@@ -519,7 +521,7 @@ index 0000000..206a542
 +static int ctcmac_of_init(struct platform_device *ofdev, struct net_device **pdev)
 +{
 +	int err = 0, index;
-+	const char *ctype, *automode;
++	const char *ctype, *automode, *dfe;
 +	struct net_device *dev = NULL;
 +	struct ctcmac_private *priv = NULL;
 +	unsigned int num_tx_qs, num_rx_qs;
@@ -582,6 +584,13 @@ index 0000000..206a542
 +		priv->autoneg_mode = CTCMAC_AUTONEG_1000BASEX_M;
 +	}else{
 +		priv->autoneg_mode = CTCMAC_AUTONEG_MAC_M;
++	}
++
++	err = of_property_read_string(np, "dfe", &dfe);
++	if((err == 0) && !strncmp(dfe, "enable", 6)){
++		priv->dfe_enable = 1;
++	}else{
++		priv->dfe_enable = 0;
 +	}
 +	
 +	priv->phy_node = of_parse_phandle(np, "phy-handle", 0);
@@ -718,26 +727,34 @@ index 0000000..206a542
 +{
 +	struct page *page = rxb->page;
 +	unsigned int size = (lstatus & CPU_MAC_DESC_INTF_W1_DESC_SIZE_MASK)>>8;
++	int data_size;
 +
 +	/* Remove the CRC from the packet length */
 +	if (lstatus & CPU_MAC_DESC_INTF_W1_DESC_EOP)
-+		size -= 4;
-+	
++		data_size = size - 4;
++	else 
++		data_size = size;
++
 +	if (likely(first)) {
-+		skb_put(skb, size);
++		skb_put(skb, data_size);
 +	} else {
-+		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
-+			rxb->page_offset, size, CTCMAC_RXB_TRUESIZE);
++		if(data_size > 0)
++			skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
++				rxb->page_offset, data_size, CTCMAC_RXB_TRUESIZE);
++		
++		if(data_size < 0)
++			pskb_trim(skb, skb->len + data_size);
 +	}
 +
 +	/* try reuse page */
 +	if (unlikely(page_count(page) != 1))
-+	return false;
++		return false;
 +
 +	/* change offset to the other half */
 +	rxb->page_offset ^= CTCMAC_RXB_TRUESIZE;
 +
-+	page_ref_inc(page);
++	if(data_size > 0)
++		page_ref_inc(page);
 +
 +	return true;
 +}
@@ -804,19 +821,167 @@ index 0000000..206a542
 +	skb->protocol = eth_type_trans(skb, ndev);
 +}
 +
++int ctc_mac_hss_write(struct ctcmac_private *priv, u8 addr, u8 data, u8 serdes_id)
++{
++	u8 accid;
++	int timeout=2000;
++	u32 val = 0, mon = 0;
++
++	if(serdes_id == 0)
++		accid = 3;
++	else if(serdes_id == 1)
++		accid = 4;
++	else
++		accid = 0;
++	val = addr | (data<<8) |(accid<<24) | (1<<31);	
++	writel(val, &priv->cpumacu_reg->CpuMacUnitHssRegAccCtl);
++
++	while(timeout--){
++		mon = readl(&priv->cpumacu_reg->CpuMacUnitHssRegAccResult);
++		if(mon & CPU_MAC_UNIT_HSS_REG_ACC_RESULT_W0_HSS_ACC_ACK_MASK){
++			break;
++		}
++		mdelay(1);
++	}
++	if(!(mon & CPU_MAC_UNIT_HSS_REG_ACC_RESULT_W0_HSS_ACC_ACK_MASK)){
++		dev_err(&priv->ndev->dev, "wait for write ack CpuMacUnitHssRegAccResult:0x%x addr 0x%x data 0x%x serdes %d fail!\n", 
++			readl(&priv->cpumacu_reg->CpuMacUnitHssRegAccResult), addr, data, serdes_id);
++		return -1;
++	}
++
++	return 0;
++}
++
++int ctc_mac_hss_read(struct ctcmac_private *priv, u8 addr, u8 *data, u8 serdes_id)
++{
++	u8 accid;
++	u32 val = 0;
++	u32 mon = 0;
++	int timeout=2000;;
++
++	if(serdes_id == 0)
++		accid = 3;
++	else if(serdes_id == 1)
++		accid = 4;
++	else
++		accid = 0;
++	val = addr | (1<<16) |(accid<<24) | (1<<31);
++
++	writel(val, &priv->cpumacu_reg->CpuMacUnitHssRegAccCtl);
++
++	while(timeout--){
++		mon = readl(&priv->cpumacu_reg->CpuMacUnitHssRegAccResult);
++		if(mon & CPU_MAC_UNIT_HSS_REG_ACC_RESULT_W0_HSS_ACC_ACK_MASK){
++			break;
++		}
++		mdelay(1);
++	}
++	if(!(mon & CPU_MAC_UNIT_HSS_REG_ACC_RESULT_W0_HSS_ACC_ACK_MASK)){
++		dev_err(&priv->ndev->dev, "wait for read ack CpuMacUnitHssRegAccResult:0x%x fail!\n", 
++			readl(&priv->cpumacu_reg->CpuMacUnitHssRegAccResult));
++		*data = 0x0;
++		return -1;
++	}
++
++	val = readl(&priv->cpumacu_reg->CpuMacUnitHssRegAccResult);
++	*data = val & 0xff;
++	
++	return 0;
++}
++
++static int ctcmac_maximize_margin_of_cmu_tempearture_ramp(struct ctcmac_private *priv)
++{
++	u8 val, ctune, delta, ctune_cal;
++	int tmpr = 0;
++
++	tmpr = get_switch_temperature();
++	if (0xffff == tmpr){
++		printk(KERN_ERR"get temperature fail!\n");
++		return -1;
++	}
++
++	ctc_mac_hss_read(priv, 0x1c, &val, 2);
++	val &= 0xf8;
++	val |= 0x4;
++	ctc_mac_hss_write(priv, 0x1c, val, 2);
++	
++	/*r_pll_dlol_en  0x30[0] write 1    enable pll lol status output*/
++	ctc_mac_hss_read(priv, 0x30, &val, 2);
++	val |= BIT(0);
++	ctc_mac_hss_write(priv, 0x30, val, 2);
++
++	if(tmpr <= -20){
++		delta = 2;	
++	}else if(tmpr <= 60){
++		delta = 1;
++	}else{
++		delta = 0;
++	}
++	/*read_vco_ctune     0xe0[3:0] read ctune raw value*/
++	ctc_mac_hss_read(priv, 0xe0, &val, 2);
++	ctune = val & 0xf;
++	ctune_cal = ctune - delta;
++	/*cfg_vco_byp_ctune  0x07[3:0] write (ctune - delta)*/
++	ctc_mac_hss_read(priv, 0x7, &val, 2);
++	val &= 0xf0;
++	val |= ctune_cal;
++	ctc_mac_hss_write(priv, 0x7, val, 2);
++	
++	/*cfg_vco_cal_byp    0x06[7]   write 1*/
++	ctc_mac_hss_read(priv, 0x6, &val, 2);
++	val |= BIT(7);
++	ctc_mac_hss_write(priv, 0x6, val, 2);
++
++	 /*for temperature -40~-20C, try (ctune-1) if (ctune-2) causes lol*/
++	mdelay(10);
++	 /*pll_lol_udl        0xe0[4]   read 0*/
++	val = ctc_mac_hss_read(priv, 0xe0, &val, 2);
++	if((0 != (val & BIT(4))) && (delta == 2)){
++		/*cfg_vco_byp_ctune  0x07[3:0] write (ctune - 1)*/
++		ctune_cal = ctune - 1;
++		ctc_mac_hss_read(priv, 0x7, &val, 2);
++		val &= 0xf0;
++		val |= ctune_cal;
++		ctc_mac_hss_write(priv, 0x7, val, 2);
++	}
++	/*check pll lol*/
++	mdelay(10);
++	/*pll_lol_udl        0xe0[4]   read 0*/
++	val = ctc_mac_hss_read(priv, 0xe0, &val, 2);
++	if(0 != (val & BIT(4))){
++		printk(KERN_ERR"maximize margin of cmu tempearture ramp fail!\n");
++		return -1;
++	}
++
++	return 0;
++}
++
 +/* serdes init flow */
 +static int ctc_mac_serdes_init(struct ctcmac_private *priv)
 +{
 +	int ret=0;
 +	u32 status;
 +	int delay_ms = 10;
-+	
-+	/* reset serdes */
-+	writel(0x83806000, &priv->cpumacu_reg->CpuMacUnitHssCfg[0]);
-+	writel(0x28061800, &priv->cpumacu_reg->CpuMacUnitHssCfg[2]);
-+	writel(0x0026c03a, &priv->cpumacu_reg->CpuMacUnitHssCfg[6]);
-+	writel(0x28061810, &priv->cpumacu_reg->CpuMacUnitHssCfg[8]);
-+	writel(0x0026c03a, &priv->cpumacu_reg->CpuMacUnitHssCfg[12]);
++
++	if(priv->dfe_enable){
++		/* reset serdes */
++		writel(0x4610b003, &priv->cpumacu_reg->CpuMacUnitHssCfg[5]);
++		writel(0x4610b003, &priv->cpumacu_reg->CpuMacUnitHssCfg[11]);
++		writel(0x83806000, &priv->cpumacu_reg->CpuMacUnitHssCfg[0]);
++		writel(0x28061800, &priv->cpumacu_reg->CpuMacUnitHssCfg[2]);
++		writel(0x0066c03a, &priv->cpumacu_reg->CpuMacUnitHssCfg[6]);
++		writel(0x28061810, &priv->cpumacu_reg->CpuMacUnitHssCfg[8]);
++		writel(0x0066c03a, &priv->cpumacu_reg->CpuMacUnitHssCfg[12]);
++	}else{
++		/* reset serdes */
++		writel(0x4610a805, &priv->cpumacu_reg->CpuMacUnitHssCfg[5]);
++		writel(0x4610a805, &priv->cpumacu_reg->CpuMacUnitHssCfg[11]);
++		writel(0x83806000, &priv->cpumacu_reg->CpuMacUnitHssCfg[0]);
++		writel(0x28061800, &priv->cpumacu_reg->CpuMacUnitHssCfg[2]);
++		writel(0x0026c02a, &priv->cpumacu_reg->CpuMacUnitHssCfg[6]);
++		writel(0x28061810, &priv->cpumacu_reg->CpuMacUnitHssCfg[8]);
++		writel(0x0026c02a, &priv->cpumacu_reg->CpuMacUnitHssCfg[12]);
++	}
 +
 +	/* offset0 bit1 BlkRstN */
 +	writel(0x83806002, &priv->cpumacu_reg->CpuMacUnitHssCfg[0]);
@@ -915,7 +1080,30 @@ index 0000000..206a542
 +	writel(0x8400014a, &priv->cpumacu_reg->CpuMacUnitHssRegAccCtl);
 +	mdelay(delay_ms);
 +	writel(0x8400e693, &priv->cpumacu_reg->CpuMacUnitHssRegAccCtl);
++	mdelay(delay_ms);
 +
++	ctc_mac_hss_write(priv, 0x0c, 0x21, 0);
++	ctc_mac_hss_write(priv, 0x0f, 0x64, 0);
++	ctc_mac_hss_write(priv, 0x1a, 0x06, 0);
++	ctc_mac_hss_write(priv, 0x91, 0x30, 0);
++	ctc_mac_hss_write(priv, 0x48, 0x20, 0);
++	ctc_mac_hss_write(priv, 0x90, 0x30, 0);
++	//ctc_mac_hss_write(priv, 0x9e, 0x36, 0);
++	//ctc_mac_hss_write(priv, 0x93, 0x76, 0);
++	ctc_mac_hss_write(priv, 0x14, 0x01, 0);
++	ctc_mac_hss_write(priv, 0x26, 0x81, 0);
++
++	ctc_mac_hss_write(priv, 0x0c, 0x21, 1);
++	ctc_mac_hss_write(priv, 0x0f, 0x64, 1);
++	ctc_mac_hss_write(priv, 0x1a, 0x06, 1);
++	ctc_mac_hss_write(priv, 0x91, 0x30, 1);
++	ctc_mac_hss_write(priv, 0x48, 0x20, 1);
++	ctc_mac_hss_write(priv, 0x90, 0x30, 1);
++	//ctc_mac_hss_write(priv, 0x9e, 0x36, 1);
++	//ctc_mac_hss_write(priv, 0x93, 0x76, 1);
++	ctc_mac_hss_write(priv, 0x14, 0x01, 1);
++	ctc_mac_hss_write(priv, 0x26, 0x81, 1);
++	
 +	/* serdes post release */
 +	writel(0x83806003, &priv->cpumacu_reg->CpuMacUnitHssCfg[0]);
 +	writel(0x83826003, &priv->cpumacu_reg->CpuMacUnitHssCfg[0]);
@@ -935,6 +1123,8 @@ index 0000000..206a542
 +			priv->ndev->name, readl(&priv->cpumacu_reg->CpuMacUnitHssMon[1]));
 +	}
 +	mdelay(delay_ms);
++
++	ctcmac_maximize_margin_of_cmu_tempearture_ramp(priv);
 +
 +	return 0;
 +}
@@ -1619,14 +1809,21 @@ index 0000000..206a542
 +			continue;
 +		}
 +		
-+		/* Increment the number of packets */
-+		total_pkts++;
-+		total_bytes += skb->len;
-+
 +		skb_record_rx_queue(skb, rx_queue->qindex);    
 +		ctcmac_process_frame(ndev, skb);
++		if(!(ndev->flags & IFF_PROMISC) 
++			&& (skb->pkt_type == PACKET_OTHERHOST)){
++			/* discard  */
++			dev_kfree_skb(skb);
++			skb = NULL;
++			rx_queue->stats.rx_dropped++;
++			continue;
++		}
++		/* Increment the number of packets */
++		total_pkts++;
++		total_bytes += skb->len+ETH_HLEN;
 +		/* Send the packet up the stack */
-+		napi_gro_receive(&rx_queue->napi_rx, skb);
++		napi_gro_receive(&priv->napi_rx, skb);
 +
 +		skb = NULL;
 +	}
@@ -2013,8 +2210,10 @@ index 0000000..206a542
 +	
 +	rxq0->token = 0;
 +	rxq0->token_max = rxq0->pps_limit * CTCMAC_TOKEN_PER_PKT;
++	rxq0->rx_trigger = 0;
 +	rxq1->token = 0;
 +	rxq1->token_max = rxq1->pps_limit * CTCMAC_TOKEN_PER_PKT;
++	rxq1->rx_trigger = 0;
 +	if(rxq0->pps_limit || rxq1->pps_limit){
 +		setup_timer(&priv->token_timer, ctcmac_token_timer, (unsigned long) priv);
 +		priv->token_timer.expires = jiffies + HZ/10;
@@ -2713,7 +2912,7 @@ index 0000000..206a542
 +		if (priv->interface == PHY_INTERFACE_MODE_SGMII){
 +			clrsetbits(&priv->cpumacu_reg->CpuMacUnitRefPulseCfg[1], 
 +			                        CPU_MAC_UNIT_REF_PULSE_CFG_W1_REF_LINK_PULSE_RST,0);
-+
++			//writel(0x1f3f, &priv->cpumacu_reg->CpuMacUnitRefPulseCfg[1]);
 +			ctc_mac_serdes_init(priv);
 +		}
 +		g_mac_unit_init_done = 1;
@@ -2848,10 +3047,10 @@ index 0000000..206a542
 +
 diff --git a/drivers/net/ethernet/centec/ctcmac.h b/drivers/net/ethernet/centec/ctcmac.h
 new file mode 100644
-index 0000000..be49d8a
+index 00000000..6dfed993
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctcmac.h
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,314 @@
 +/*
 + * Centec CpuMac Ethernet Driver -- CpuMac controller implementation
 + * Provides Bus interface for MIIM regs
@@ -3022,8 +3221,6 @@ index 0000000..be49d8a
 +	u16 next_to_alloc;
 +	struct	sk_buff *skb;
 +	struct rxq_stats stats;
-+	struct	napi_struct napi_rx;
-+	struct	napi_struct napi_tx;
 +	u32 pps_limit;
 +	u32 token, token_max;
 +	u32 rx_trigger;
@@ -3084,6 +3281,7 @@ index 0000000..be49d8a
 +	u32 supported;
 +	u32 msg_enable;
 +	u32 int_type;
++	u8 dfe_enable;
 +	struct timer_list token_timer;
 +};
 +
@@ -3169,7 +3367,7 @@ index 0000000..be49d8a
 +
 diff --git a/drivers/net/ethernet/centec/ctcmac_reg.h b/drivers/net/ethernet/centec/ctcmac_reg.h
 new file mode 100644
-index 0000000..affda1a
+index 00000000..affda1a2
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctcmac_reg.h
 @@ -0,0 +1,5416 @@
@@ -8591,7 +8789,7 @@ index 0000000..affda1a
 +
 diff --git a/drivers/net/ethernet/centec/ctcmac_test.c b/drivers/net/ethernet/centec/ctcmac_test.c
 new file mode 100644
-index 0000000..3ae603a
+index 00000000..63d7581c
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctcmac_test.c
 @@ -0,0 +1,2101 @@
@@ -10038,7 +10236,7 @@ index 0000000..3ae603a
 +		skb_record_rx_queue(skb, rx_queue->qindex);    
 +		ctcmac_process_frame(ndev, skb);
 +		/* Send the packet up the stack */
-+		napi_gro_receive(&rx_queue->napi_rx, skb);
++		napi_gro_receive(&priv->napi_rx, skb);
 +
 +		skb = NULL;
 +	}
