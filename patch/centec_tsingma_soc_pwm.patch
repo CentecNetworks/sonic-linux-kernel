@@ -1,3 +1,15 @@
+From d2ff8ebea198b5f92a8f92b3beda5cd4db55ed12 Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:22 +0000
+Subject: [PATCH 09/14] [centec][arm64] tsingma soc pwm
+
+---
+ drivers/pwm/Kconfig   |   5 +-
+ drivers/pwm/Makefile  |   1 +
+ drivers/pwm/pwm-ctc.c | 235 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 240 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/pwm/pwm-ctc.c
+
 diff --git a/drivers/pwm/Kconfig b/drivers/pwm/Kconfig
 index bf01288..ce80bf0 100644
 --- a/drivers/pwm/Kconfig
@@ -262,3 +274,6 @@ index 0000000..d9427b7
 +
 +MODULE_LICENSE("GPL");
 +MODULE_ALIAS("platform:centec-pwm");
+-- 
+2.7.4
+

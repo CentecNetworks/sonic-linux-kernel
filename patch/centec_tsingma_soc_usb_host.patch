@@ -1,3 +1,15 @@
+From 275b61a784401ef725fec02e6477f8988cb78047 Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:30 +0000
+Subject: [PATCH 12/14] [centec][arm64] tsingma soc usb host
+
+---
+ drivers/usb/host/Kconfig    |   6 +
+ drivers/usb/host/Makefile   |   1 +
+ drivers/usb/host/ehci-ctc.c | 416 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 423 insertions(+)
+ create mode 100644 drivers/usb/host/ehci-ctc.c
+
 diff --git a/drivers/usb/host/Kconfig b/drivers/usb/host/Kconfig
 index 0e7cc71..db23954 100644
 --- a/drivers/usb/host/Kconfig
@@ -449,3 +461,6 @@ index 0000000..eba4182
 +MODULE_AUTHOR("Alan Stern");
 +MODULE_LICENSE("GPL");
 +
+-- 
+2.7.4
+

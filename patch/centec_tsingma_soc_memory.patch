@@ -1,3 +1,15 @@
+From 728885d497bb7eb1446ec10b2d868a8aab799792 Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:12 +0000
+Subject: [PATCH 05/14] [centec][arm64] tsingma soc memory
+
+---
+ drivers/memory/Kconfig      |   6 +
+ drivers/memory/Makefile     |   1 +
+ drivers/memory/ctc5236-mc.c | 320 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 327 insertions(+)
+ create mode 100644 drivers/memory/ctc5236-mc.c
+
 diff --git a/drivers/memory/Kconfig b/drivers/memory/Kconfig
 index 4b4c0c3..16181d5 100644
 --- a/drivers/memory/Kconfig
@@ -353,3 +365,6 @@ index 0000000..4717516
 +MODULE_LICENSE("GPL");
 +MODULE_AUTHOR("Centec Network");
 +MODULE_DESCRIPTION("Centec TsingMa memory contoller driver");
+-- 
+2.7.4
+

@@ -1,5 +1,29 @@
+From 5214cf2dd27ca007b17a4c4c2fe0ef05de412335 Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:04 +0000
+Subject: [PATCH 02/14] [centec][arm64] tsingma soc ethernet
+
+---
+ drivers/net/ethernet/Kconfig               |    2 +-
+ drivers/net/ethernet/Makefile              |    1 +
+ drivers/net/ethernet/centec/Kconfig        |   10 +
+ drivers/net/ethernet/centec/Makefile       |    1 +
+ drivers/net/ethernet/centec/ctc5236_mdio.c |  205 ++
+ drivers/net/ethernet/centec/ctcmac.c       | 2787 ++++++++++++++
+ drivers/net/ethernet/centec/ctcmac.h       |  314 ++
+ drivers/net/ethernet/centec/ctcmac_reg.h   | 5416 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/centec/ctcmac_test.c  | 2101 +++++++++++
+ 9 files changed, 10836 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/centec/Kconfig
+ create mode 100644 drivers/net/ethernet/centec/Makefile
+ create mode 100644 drivers/net/ethernet/centec/ctc5236_mdio.c
+ create mode 100644 drivers/net/ethernet/centec/ctcmac.c
+ create mode 100644 drivers/net/ethernet/centec/ctcmac.h
+ create mode 100644 drivers/net/ethernet/centec/ctcmac_reg.h
+ create mode 100644 drivers/net/ethernet/centec/ctcmac_test.c
+
 diff --git a/drivers/net/ethernet/Kconfig b/drivers/net/ethernet/Kconfig
-index 8cc7467b..6e217d7f 100644
+index 8cc7467..6e217d7 100644
 --- a/drivers/net/ethernet/Kconfig
 +++ b/drivers/net/ethernet/Kconfig
 @@ -179,5 +179,5 @@ source "drivers/net/ethernet/via/Kconfig"
@@ -10,7 +34,7 @@ index 8cc7467b..6e217d7f 100644
 +source "drivers/net/ethernet/centec/Kconfig"
  endif # ETHERNET
 diff --git a/drivers/net/ethernet/Makefile b/drivers/net/ethernet/Makefile
-index a09423df..fd678701 100644
+index a09423d..fd67870 100644
 --- a/drivers/net/ethernet/Makefile
 +++ b/drivers/net/ethernet/Makefile
 @@ -89,3 +89,4 @@ obj-$(CONFIG_NET_VENDOR_VIA) += via/
@@ -20,7 +44,7 @@ index a09423df..fd678701 100644
 +obj-$(CONFIG_NET_VENDOR_CENTEC) += centec/
 diff --git a/drivers/net/ethernet/centec/Kconfig b/drivers/net/ethernet/centec/Kconfig
 new file mode 100644
-index 00000000..e2c5ffcf
+index 0000000..e2c5ffc
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/Kconfig
 @@ -0,0 +1,10 @@
@@ -36,14 +60,14 @@ index 00000000..e2c5ffcf
 +
 diff --git a/drivers/net/ethernet/centec/Makefile b/drivers/net/ethernet/centec/Makefile
 new file mode 100644
-index 00000000..4eb5938b
+index 0000000..4eb5938
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/Makefile
 @@ -0,0 +1 @@
 +obj-$(CONFIG_NET_VENDOR_CENTEC) += ctcmac.o  ctcmac_test.o ctc5236_mdio.o
 diff --git a/drivers/net/ethernet/centec/ctc5236_mdio.c b/drivers/net/ethernet/centec/ctc5236_mdio.c
 new file mode 100644
-index 00000000..8729c0e3
+index 0000000..8729c0e
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctc5236_mdio.c
 @@ -0,0 +1,205 @@
@@ -254,7 +278,7 @@ index 00000000..8729c0e3
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/net/ethernet/centec/ctcmac.c b/drivers/net/ethernet/centec/ctcmac.c
 new file mode 100644
-index 00000000..96d5bedb
+index 0000000..96d5bed
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctcmac.c
 @@ -0,0 +1,2787 @@
@@ -3047,7 +3071,7 @@ index 00000000..96d5bedb
 +
 diff --git a/drivers/net/ethernet/centec/ctcmac.h b/drivers/net/ethernet/centec/ctcmac.h
 new file mode 100644
-index 00000000..6dfed993
+index 0000000..6dfed99
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctcmac.h
 @@ -0,0 +1,314 @@
@@ -3367,7 +3391,7 @@ index 00000000..6dfed993
 +
 diff --git a/drivers/net/ethernet/centec/ctcmac_reg.h b/drivers/net/ethernet/centec/ctcmac_reg.h
 new file mode 100644
-index 00000000..affda1a2
+index 0000000..affda1a
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctcmac_reg.h
 @@ -0,0 +1,5416 @@
@@ -8789,7 +8813,7 @@ index 00000000..affda1a2
 +
 diff --git a/drivers/net/ethernet/centec/ctcmac_test.c b/drivers/net/ethernet/centec/ctcmac_test.c
 new file mode 100644
-index 00000000..63d7581c
+index 0000000..63d7581
 --- /dev/null
 +++ b/drivers/net/ethernet/centec/ctcmac_test.c
 @@ -0,0 +1,2101 @@
@@ -10894,3 +10918,6 @@ index 00000000..63d7581c
 +
 +module_platform_driver(ctcmac_driver);
 +MODULE_LICENSE("GPL");
+-- 
+2.7.4
+

@@ -1,8 +1,31 @@
+From 212606fb9773ea7d3ae858a4166478870b2330d9 Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:20 +0000
+Subject: [PATCH 08/14] [centec][arm64] tsingma soc platform
+
+---
+ arch/arm64/Kconfig.platforms             |    7 +
+ drivers/soc/Kconfig                      |    2 +-
+ drivers/soc/Makefile                     |    1 +
+ drivers/soc/centec/Kconfig               |    9 +
+ drivers/soc/centec/Makefile              |    4 +
+ drivers/soc/centec/ctc5236_switch.c      |  348 ++++
+ include/dt-bindings/clock/ctc5236-clks.h |   25 +
+ include/soc/ctc/ctc5236_switch.h         |   46 +
+ include/soc/ctc/sysctl.h                 | 2716 ++++++++++++++++++++++++++++++
+ 9 files changed, 3157 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/soc/centec/Kconfig
+ create mode 100644 drivers/soc/centec/Makefile
+ create mode 100644 drivers/soc/centec/ctc5236_switch.c
+ create mode 100644 include/dt-bindings/clock/ctc5236-clks.h
+ create mode 100644 include/soc/ctc/ctc5236_switch.h
+ create mode 100644 include/soc/ctc/sysctl.h
+
 diff --git a/arch/arm64/Kconfig.platforms b/arch/arm64/Kconfig.platforms
-index 3428a4b..62651c7 100644
+index 2f9c2a9..f97b00e 100644
 --- a/arch/arm64/Kconfig.platforms
 +++ b/arch/arm64/Kconfig.platforms
-@@ -231,4 +231,11 @@ config ARCH_ZYNQMP
+@@ -232,4 +232,11 @@ config ARCH_ZYNQMP
  	help
  	  This enables support for Xilinx ZynqMP Family
  
@@ -3218,3 +3241,6 @@ index 0000000..2b0c3fc
 +	
 +#endif /*__CTC5236_SYSCTL_H__*/
 +
+-- 
+2.7.4
+

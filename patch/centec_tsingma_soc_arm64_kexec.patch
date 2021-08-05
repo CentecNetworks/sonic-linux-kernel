@@ -1,14 +1,14 @@
-From a5fd6c5b2048b4fca5148575d4d47409b47e69c6 Mon Sep 17 00:00:00 2001
+From 75cd009d46792c45f923b776590c6e66cc991674 Mon Sep 17 00:00:00 2001
 From: shil <shil@centecnetworks.com>
 Date: Thu, 30 Jul 2020 21:57:23 +0800
-Subject: [PATCH] support arm64 kexec
+Subject: [PATCH 14/14] [centec][arm64] tsingma soc arm64 kexec
 
 ---
- arch/arm64/include/asm/virt.h               |  6 ++-
+ arch/arm64/include/asm/virt.h               |  6 +++-
  arch/arm64/kernel/Makefile                  |  3 +-
- arch/arm64/kernel/cpu-park.S                | 56 +++++++++++++++++++++
- arch/arm64/kernel/cpu-park.h                | 29 +++++++++++
- arch/arm64/kernel/smp_spin_table.c          | 46 ++++++++++++++---
+ arch/arm64/kernel/cpu-park.S                | 56 +++++++++++++++++++++++++++++
+ arch/arm64/kernel/cpu-park.h                | 29 +++++++++++++++
+ arch/arm64/kernel/smp_spin_table.c          | 46 +++++++++++++++++++-----
  debian/build/build_arm64_none_arm64/.config |  1 +
  6 files changed, 131 insertions(+), 10 deletions(-)
  create mode 100644 arch/arm64/kernel/cpu-park.S
@@ -237,10 +237,10 @@ index 9a00eee..d641975 100644
 +#endif
  };
 diff --git a/debian/build/build_arm64_none_arm64/.config b/debian/build/build_arm64_none_arm64/.config
-index ffb2f49..136f7e1 100644
+index f5b4146..8404f5a 100644
 --- a/debian/build/build_arm64_none_arm64/.config
 +++ b/debian/build/build_arm64_none_arm64/.config
-@@ -6535,6 +6535,7 @@ CONFIG_NTFS_FS=m
+@@ -6536,6 +6536,7 @@ CONFIG_NTFS_FS=m
  #
  CONFIG_PROC_FS=y
  CONFIG_PROC_KCORE=y
@@ -249,5 +249,5 @@ index ffb2f49..136f7e1 100644
  CONFIG_PROC_PAGE_MONITOR=y
  CONFIG_PROC_CHILDREN=y
 -- 
-2.17.1
+2.7.4
 

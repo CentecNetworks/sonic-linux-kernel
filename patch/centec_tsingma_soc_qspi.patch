@@ -1,3 +1,15 @@
+From f8202ef398318db0a6efccea5e4123745dd987e2 Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:25 +0000
+Subject: [PATCH 10/14] [centec][arm64] tsingma soc qspi
+
+---
+ drivers/spi/Kconfig        |   6 +
+ drivers/spi/Makefile       |   1 +
+ drivers/spi/spi-ctc-qspi.c | 666 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 673 insertions(+)
+ create mode 100644 drivers/spi/spi-ctc-qspi.c
+
 diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
 index b799547..54581e7 100644
 --- a/drivers/spi/Kconfig
@@ -696,3 +708,6 @@ index 0000000..a9da3c4
 +
 +MODULE_AUTHOR("Centec, Inc.");
 +MODULE_LICENSE("GPL");
+-- 
+2.7.4
+

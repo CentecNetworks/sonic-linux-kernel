@@ -1,3 +1,17 @@
+From 65d008ddfabf80bdeea26806d4aeb2a67f3af546 Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:17 +0000
+Subject: [PATCH 07/14] [centec][arm64] tsingma soc pinctrl
+
+---
+ drivers/pinctrl/Kconfig                   |   8 +
+ drivers/pinctrl/Makefile                  |   1 +
+ drivers/pinctrl/pinctrl-ctc.c             | 542 ++++++++++++++++++++++++++++++
+ include/dt-bindings/pinctrl/pinctrl-ctc.h |  25 ++
+ 4 files changed, 576 insertions(+)
+ create mode 100644 drivers/pinctrl/pinctrl-ctc.c
+ create mode 100644 include/dt-bindings/pinctrl/pinctrl-ctc.h
+
 diff --git a/drivers/pinctrl/Kconfig b/drivers/pinctrl/Kconfig
 index b0c0fa0..6f4889c 100644
 --- a/drivers/pinctrl/Kconfig
@@ -605,3 +619,6 @@ index 0000000..e2983fb
 +#define PIN_FUNC_FC        1
 +#endif
 +
+-- 
+2.7.4
+

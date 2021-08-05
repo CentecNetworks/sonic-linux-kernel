@@ -1,8 +1,22 @@
+From fa5414c553c251f8418c935a544d0a7a8a298eb1 Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:09 +0000
+Subject: [PATCH 04/14] [centec][arm64] tsingma soc i2c
+
+---
+ drivers/i2c/busses/Kconfig   |   6 +
+ drivers/i2c/busses/Makefile  |   1 +
+ drivers/i2c/busses/i2c-ctc.c | 866 +++++++++++++++++++++++++++++++++++++++++++
+ drivers/i2c/busses/i2c-ctc.h | 205 ++++++++++
+ 4 files changed, 1078 insertions(+)
+ create mode 100644 drivers/i2c/busses/i2c-ctc.c
+ create mode 100644 drivers/i2c/busses/i2c-ctc.h
+
 diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
-index d252276..c17b562 100644
+index 7f59c4a..680cc27 100644
 --- a/drivers/i2c/busses/Kconfig
 +++ b/drivers/i2c/busses/Kconfig
-@@ -478,6 +478,12 @@ config I2C_DESIGNWARE_PLATFORM
+@@ -479,6 +479,12 @@ config I2C_DESIGNWARE_PLATFORM
  	  This driver can also be built as a module.  If so, the module
  	  will be called i2c-designware-platform.
  
@@ -16,7 +30,7 @@ index d252276..c17b562 100644
  	tristate "Synopsys DesignWare PCI"
  	depends on PCI
 diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
-index 29764cc..1546b09 100644
+index 645bf08..543add6 100644
 --- a/drivers/i2c/busses/Makefile
 +++ b/drivers/i2c/busses/Makefile
 @@ -45,6 +45,7 @@ i2c-designware-platform-objs := i2c-designware-platdrv.o
@@ -29,10 +43,10 @@ index 29764cc..1546b09 100644
  obj-$(CONFIG_I2C_EG20T)		+= i2c-eg20t.o
 diff --git a/drivers/i2c/busses/i2c-ctc.c b/drivers/i2c/busses/i2c-ctc.c
 new file mode 100644
-index 0000000..aeb20f6
+index 0000000..bd44152
 --- /dev/null
 +++ b/drivers/i2c/busses/i2c-ctc.c
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,866 @@
 +/*
 + * Centec I2C controller driver
 + *
@@ -56,38 +70,35 @@ index 0000000..aeb20f6
 +#include <linux/io.h>
 +#include <linux/export.h>
 +#include "i2c-ctc.h"
++#include <dt-bindings/pinctrl/pinctrl-ctc.h>
++#include <soc/ctc/sysctl.h>
++#include <linux/mfd/syscon.h>
++#include <linux/regmap.h>
 +
 +#define IC_ICK_NS(f) (1000000000 / f)
 +
 +static char *abort_sources[] = {
-+	[ABRT_7B_ADDR_NOACK] =
-+		"slave address not acknowledged (7bit mode)",
++	[ABRT_7B_ADDR_NOACK] = "slave address not acknowledged (7bit mode)",
 +	[ABRT_10ADDR1_NOACK] =
-+		"first address byte not acknowledged (10bit mode)",
++	    "first address byte not acknowledged (10bit mode)",
 +	[ABRT_10ADDR2_NOACK] =
-+		"second address byte not acknowledged (10bit mode)",
-+	[ABRT_TXDATA_NOACK] =
-+		"data not acknowledged",
-+	[ABRT_GCALL_NOACK] =
-+		"no acknowledgement for a general call",
-+	[ABRT_GCALL_READ] =
-+		"read after general call",
-+	[ABRT_SBYTE_ACKDET] =
-+		"start byte acknowledged",
++	    "second address byte not acknowledged (10bit mode)",
++	[ABRT_TXDATA_NOACK] = "data not acknowledged",
++	[ABRT_GCALL_NOACK] = "no acknowledgement for a general call",
++	[ABRT_GCALL_READ] = "read after general call",
++	[ABRT_SBYTE_ACKDET] = "start byte acknowledged",
 +	[ABRT_SBYTE_NORSTRT] =
-+		"trying to send start byte when restart is disabled",
++	    "trying to send start byte when restart is disabled",
 +	[ABRT_10B_RD_NORSTRT] =
-+		"trying to read when restart is disabled (10bit mode)",
-+	[ABRT_MASTER_DIS] =
-+		"trying to use disabled adapter",
-+	[ARB_LOST] =
-+		"lost arbitration",
++	    "trying to read when restart is disabled (10bit mode)",
++	[ABRT_MASTER_DIS] = "trying to use disabled adapter",
++	[ARB_LOST] = "lost arbitration",
 +};
 +
 +static u32 ctc_readl(struct ctc_i2c_dev *dev, int offset)
 +{
 +	u32 value;
-+	
++
 +	value = readl_relaxed(dev->base + offset);
 +	return value;
 +}
@@ -108,7 +119,8 @@ index 0000000..aeb20f6
 +		usleep_range(25, 250);
 +	} while (timeout--);
 +
-+	dev_warn(dev->dev, "timeout in %sabling adapter\n", enable ? "en" : "dis");
++	dev_warn(dev->dev, "timeout in %sabling adapter\n",
++		 enable ? "en" : "dis");
 +}
 +
 +/* Conditional expression:
@@ -122,7 +134,7 @@ index 0000000..aeb20f6
 +
 +static u32 __ctc_calc_fs_cnt(u32 clk_freq)
 +{
-+	return CTC_SCL_Timing(clk_freq) / 2 / 20  + 1;
++	return CTC_SCL_Timing(clk_freq) / 2 / 20 + 1;
 +}
 +
 +int i2c_ctc_init(struct ctc_i2c_dev *dev)
@@ -132,7 +144,8 @@ index 0000000..aeb20f6
 +
 +	reg = ctc_readl(dev, CTC_IC_COMP_TYPE);
 +	if (reg != CTC_IC_COMP_TYPE_VALUE) {
-+		dev_err(dev->dev, "Unknown Centec component type: 0x%08x\n", reg);
++		dev_err(dev->dev, "Unknown Centec component type: 0x%08x\n",
++			reg);
 +		return -ENODEV;
 +	}
 +
@@ -140,21 +153,25 @@ index 0000000..aeb20f6
 +	__i2c_ctc_enable(dev, false);
 +
 +	/* Set SCL timing parameters */
-+	if ((dev->master_cfg & CTC_IC_CON_SPEED_MASK) == CTC_IC_CON_SPEED_FAST){
++	if ((dev->master_cfg & CTC_IC_CON_SPEED_MASK) == CTC_IC_CON_SPEED_FAST) {
 +		hcnt = __ctc_calc_fs_cnt(dev->clk_freq) - 14 - 4;
-+		lcnt = __ctc_calc_fs_cnt(dev->clk_freq) - 1 -2;
++		lcnt = __ctc_calc_fs_cnt(dev->clk_freq) - 1 - 2;
 +
 +		ctc_writel(dev, hcnt, CTC_IC_FS_SCL_HCNT);
 +		ctc_writel(dev, lcnt, CTC_IC_FS_SCL_LCNT);
-+		dev_info(dev->dev, "Fast-mode HCNT:LCNT = %d:%d, clk_freq = %d\n", hcnt, lcnt, dev->clk_freq);
-+	
-+	}else {
++		dev_info(dev->dev,
++			 "Fast-mode HCNT:LCNT = %d:%d, clk_freq = %d\n", hcnt,
++			 lcnt, dev->clk_freq);
++
++	} else {
 +		hcnt = __ctc_calc_ss_cnt(dev->clk_freq) - 14 - 4;
 +		lcnt = __ctc_calc_ss_cnt(dev->clk_freq) - 1 - 2;
-+		
++
 +		ctc_writel(dev, hcnt, CTC_IC_SS_SCL_HCNT);
 +		ctc_writel(dev, lcnt, CTC_IC_SS_SCL_LCNT);
-+		dev_info(dev->dev, "Standard-mode HCNT:LCNT = %d:%d, clk_freq = %d\n", hcnt, lcnt, dev->clk_freq);
++		dev_info(dev->dev,
++			 "Standard-mode HCNT:LCNT = %d:%d, clk_freq = %d\n",
++			 hcnt, lcnt, dev->clk_freq);
 +	}
 +
 +	/* Configure SDA Hold Time if required */
@@ -165,13 +182,36 @@ index 0000000..aeb20f6
 +	/* Configure Tx/Rx FIFO threshold levels */
 +	comp_param1 = ctc_readl(dev, CTC_IC_COMP_PARAM_1);
 +	dev->tx_fifo_depth = ((comp_param1 >> 16) & 0xff) + 1;
-+	dev->rx_fifo_depth = ((comp_param1 >> 8)  & 0xff) + 1;
-+	
++	dev->rx_fifo_depth = ((comp_param1 >> 8) & 0xff) + 1;
++
 +	ctc_writel(dev, dev->tx_fifo_depth / 2, CTC_IC_TX_TL);
 +	ctc_writel(dev, 0, CTC_IC_RX_TL);
 +
 +	/* Configure the i2c master */
-+	ctc_writel(dev, dev->master_cfg , CTC_IC_CON);
++	ctc_writel(dev, dev->master_cfg, CTC_IC_CON);
++
++	return 0;
++}
++
++int i2c_ctc_recover_bus(struct i2c_adapter *adap)
++{
++	struct ctc_i2c_dev *dev = i2c_get_adapdata(adap);
++	u32 val;
++
++	dev_info(dev->dev, "Trying i2c bus recovery\\n");
++
++	val = 0x3;
++	regmap_write(dev->regmap_base,
++		     offsetof(struct SysCtl_regs, SysI2CResetCtl), val);
++	val = 0x0;
++	regmap_write(dev->regmap_base,
++		     offsetof(struct SysCtl_regs, SysI2CResetCtl), val);
++
++	if (dev->soc_ver == CTC_REV_TM_1_1) {
++		ctc_writel(dev, 0x1, CTC_IC_BUS_CLEAR_EN);
++	}
++
++	i2c_ctc_init(dev);
 +
 +	return 0;
 +}
@@ -183,7 +223,14 @@ index 0000000..aeb20f6
 +	while (ctc_readl(dev, CTC_IC_STATUS) & CTC_IC_STATUS_ACTIVITY) {
 +		if (timeout <= 0) {
 +			dev_warn(dev->dev, "timeout waiting for bus ready\n");
-+			return -ETIMEDOUT;
++			i2c_recover_bus(&dev->adapter);
++			if (ctc_readl(dev, CTC_IC_STATUS) &
++			    CTC_IC_STATUS_ACTIVITY) {
++				dev_warn(dev->dev,
++					 "timeout waiting for bus ready again\n");
++				return -ETIMEDOUT;
++			}
++			return 0;
 +		}
 +		timeout--;
 +		usleep_range(1000, 1100);
@@ -236,17 +283,17 @@ index 0000000..aeb20f6
 +
 +	if (abort_source & CTC_IC_TX_ABRT_NOACK) {
 +		for_each_set_bit(i, &abort_source, ARRAY_SIZE(abort_sources))
-+			dev_dbg(dev->dev, "%s: %s\n", __func__, abort_sources[i]);
++		    dev_dbg(dev->dev, "%s: %s\n", __func__, abort_sources[i]);
 +		return -EREMOTEIO;
 +	}
 +
 +	for_each_set_bit(i, &abort_source, ARRAY_SIZE(abort_sources))
-+		dev_err(dev->dev, "%s: %s\n", __func__, abort_sources[i]);
++	    dev_err(dev->dev, "%s: %s\n", __func__, abort_sources[i]);
 +
 +	if (abort_source & CTC_IC_TX_ARB_LOST)
 +		return -EAGAIN;
 +	else if (abort_source & CTC_IC_TX_ABRT_GCALL_READ)
-+		return -EINVAL; 
++		return -EINVAL;
 +	else
 +		return -EIO;
 +}
@@ -258,7 +305,7 @@ index 0000000..aeb20f6
 +	mutex_lock(&dev->lock);
 +
 +	reinit_completion(&dev->cmd_complete);
-+	
++
 +	dev->cmd_err = 0;
 +	dev->msg_write_idx = 0;
 +	dev->msg_read_idx = 0;
@@ -277,7 +324,7 @@ index 0000000..aeb20f6
 +	/* wait for tx to complete */
 +	if (!wait_for_completion_timeout(&dev->cmd_complete, HZ)) {
 +		dev_err(dev->dev, "controller timed out\n");
-+		i2c_ctc_init(dev);
++		i2c_recover_bus(&dev->adapter);
 +		ret = -ETIMEDOUT;
 +		goto done;
 +	}
@@ -317,26 +364,28 @@ index 0000000..aeb20f6
 +{
 +	int ret;
 +	ulong start_stop_det = jiffies;
-+	
++
 +	while (1) {
-+		if ((ctc_readl(dev, CTC_IC_RAW_INTR_STAT) & CTC_IC_INTR_STOP_DET)) {
++		if ((ctc_readl(dev, CTC_IC_RAW_INTR_STAT) &
++		     CTC_IC_INTR_STOP_DET)) {
 +			ctc_readl(dev, CTC_IC_CLR_STOP_DET);
 +			break;
 +		} else if (time_after(jiffies, start_stop_det + I2C_STOPDET_TO)) {
 +			break;
-+		}	
++		}
 +	}
-+	
++
 +	ret = i2c_ctc_wait_bus_not_busy(dev);
 +	if (ret < 0)
 +		return -1;
-+	
++
 +	ctc_i2c_flush_rxfifo(dev);
 +
 +	return 0;
 +}
 +
-+static int __ctc_i2c_read(struct ctc_i2c_dev *dev, __u16 chip_addr, u8 *offset, __u16 olen, u8 *data, __u16 dlen)
++static int __ctc_i2c_read(struct ctc_i2c_dev *dev, __u16 chip_addr, u8 * offset,
++			  __u16 olen, u8 * data, __u16 dlen)
 +{
 +	unsigned int active = 0;
 +	unsigned int flag = 0;
@@ -356,53 +405,59 @@ index 0000000..aeb20f6
 +	/* Enable the adapter */
 +	__i2c_ctc_enable(dev, true);
 +
-+	if (olen > 0){
++	if (olen > 0) {
 +		ctc_writel(dev, *offset | CTC_RESTART, CTC_IC_DATA_CMD);
-+		olen --;
-+		while (olen){
++		olen--;
++		while (olen) {
 +			offset++;
 +			olen--;
 +			ctc_writel(dev, *offset, CTC_IC_DATA_CMD);
 +		}
 +	}
-+	
++
 +	start_time_rx = jiffies;
 +	while (dlen) {
 +		if (!active) {
-+			if (flag == 0){
-+				if(dlen == 1){
-+					ctc_writel(dev, CTC_CMD_READ | CTC_STOP | CTC_RESTART, CTC_IC_DATA_CMD);
++			if (flag == 0) {
++				if (dlen == 1) {
++					ctc_writel(dev,
++						   CTC_CMD_READ | CTC_STOP |
++						   CTC_RESTART,
++						   CTC_IC_DATA_CMD);
 +				} else {
-+					ctc_writel(dev, CTC_CMD_READ | CTC_RESTART, CTC_IC_DATA_CMD);
-+				}	
++					ctc_writel(dev,
++						   CTC_CMD_READ | CTC_RESTART,
++						   CTC_IC_DATA_CMD);
++				}
 +				flag = 1;
-+			}
-+			else if (dlen !=1){
++			} else if (dlen != 1) {
 +				ctc_writel(dev, CTC_CMD_READ, CTC_IC_DATA_CMD);
++			} else {
++				ctc_writel(dev, CTC_CMD_READ | CTC_STOP,
++					   CTC_IC_DATA_CMD);
 +			}
-+			else{
-+				ctc_writel(dev, CTC_CMD_READ | CTC_STOP, CTC_IC_DATA_CMD);				
-+			}
-+			active = 1;	
-+		}	
++			active = 1;
++		}
 +		if (ctc_readl(dev, CTC_IC_STATUS) & CTC_IC_STATUS_RFNE) {
-+			*data++ = (unsigned char)ctc_readl(dev, CTC_IC_DATA_CMD);
++			*data++ =
++			    (unsigned char)ctc_readl(dev, CTC_IC_DATA_CMD);
 +			dlen--;
 +			start_time_rx = jiffies;
 +			active = 0;
 +		} else if (time_after(jiffies, start_time_rx + I2C_BYTE_TO)) {
 +			return -ETIMEDOUT;
 +		}
-+	}	
++	}
 +
 +	return ctc_i2c_xfer_finish(dev);
-+}	
++}
 +
-+static int __ctc_i2c_write(struct ctc_i2c_dev *dev, __u16 chip_addr, u8 *offset, __u16 olen, u8 *data, __u16 dlen)
++static int __ctc_i2c_write(struct ctc_i2c_dev *dev, __u16 chip_addr,
++			   u8 * offset, __u16 olen, u8 * data, __u16 dlen)
 +{
 +	int ret;
 +	unsigned long start_time_tx;
-+	int nb = dlen;	
++	int nb = dlen;
 +
 +	ret = i2c_ctc_wait_bus_not_busy(dev);
 +	if (ret < 0)
@@ -416,19 +471,21 @@ index 0000000..aeb20f6
 +
 +	/* Enable the adapter */
 +	__i2c_ctc_enable(dev, true);
-+	
++
 +	start_time_tx = jiffies;
-+	while(dlen) {
++	while (dlen) {
 +		if (ctc_readl(dev, CTC_IC_STATUS) & CTC_IC_STATUS_TFNF) {
-+			if (--dlen == 0){
-+				ctc_writel(dev, *data | CTC_STOP, CTC_IC_DATA_CMD);
-+			}
-+			else {
++			if (--dlen == 0) {
++				ctc_writel(dev, *data | CTC_STOP,
++					   CTC_IC_DATA_CMD);
++			} else {
 +				ctc_writel(dev, *data, CTC_IC_DATA_CMD);
 +			}
-+			data ++;
++			data++;
 +			start_time_tx = jiffies;
-+		} else if (time_after(jiffies, start_time_tx + (nb * I2C_BYTE_TO))) {
++		} else
++		    if (time_after(jiffies, start_time_tx + (nb * I2C_BYTE_TO)))
++		{
 +			dev_err(dev->dev, "Timed out. i2c write Failed\n");
 +			return -ETIMEDOUT;
 +		}
@@ -446,27 +503,28 @@ index 0000000..aeb20f6
 +	/* We expect either two messages (one with an offset and one with the
 +	 * actucal data) or one message (just data) */
 +	if (dev->msgs_num > 2 || dev->msgs_num == 0) {
-+		dev_err(dev->dev, "%s: Only one or two messages are supported.", __func__);
++		dev_err(dev->dev, "%s: Only one or two messages are supported.",
++			__func__);
 +		return -1;
 +	}
-+	
-+	omsg = dev->msgs_num == 1 ? &dummy : dev->msgs;	
-+	dmsg = dev->msgs_num == 1 ? dev->msgs : (dev->msgs + 1);	
++
++	omsg = dev->msgs_num == 1 ? &dummy : dev->msgs;
++	dmsg = dev->msgs_num == 1 ? dev->msgs : (dev->msgs + 1);
 +
 +	if (dmsg->flags & I2C_M_RD) {
-+		ret =  __ctc_i2c_read(dev, dmsg->addr, omsg->buf, omsg->len, 
-+					dmsg->buf, dmsg->len);
-+	}
-+	else
-+		ret = __ctc_i2c_write(dev, dmsg->addr, omsg->buf, omsg->len, 
-+					dmsg->buf, dmsg->len);
++		ret = __ctc_i2c_read(dev, dmsg->addr, omsg->buf, omsg->len,
++				     dmsg->buf, dmsg->len);
++	} else
++		ret = __ctc_i2c_write(dev, dmsg->addr, omsg->buf, omsg->len,
++				      dmsg->buf, dmsg->len);
 +	if (!ret)
 +		return dev->msgs_num;
 +	else
 +		return -EIO;
 +}
 +
-+static int i2c_ctc_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
++static int i2c_ctc_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
++			int num)
 +{
 +	struct ctc_i2c_dev *dev = i2c_get_adapdata(adap);
 +	int ret;
@@ -476,7 +534,7 @@ index 0000000..aeb20f6
 +	dev->msgs_num = num;
 +
 +	if (dev->xfer_type == CTC_IC_INTERRUPT_TRANSFER)
-+		ret= i2c_ctc_interrupt_transfer(dev);
++		ret = i2c_ctc_interrupt_transfer(dev);
 +	else
 +		ret = i2c_ctc_polling_transfer(dev);
 +
@@ -499,13 +557,15 @@ index 0000000..aeb20f6
 +	for (; dev->msg_write_idx < dev->msgs_num; dev->msg_write_idx++) {
 +
 +		if (msgs[dev->msg_write_idx].addr != addr) {
-+			dev_err(dev->dev, "%s: invalid target address\n", __func__);
++			dev_err(dev->dev, "%s: invalid target address\n",
++				__func__);
 +			dev->msg_err = -EINVAL;
 +			break;
 +		}
 +
 +		if (msgs[dev->msg_write_idx].len == 0) {
-+			dev_err(dev->dev, "%s: invalid message length\n", __func__);
++			dev_err(dev->dev, "%s: invalid message length\n",
++				__func__);
 +			dev->msg_err = -EINVAL;
 +			break;
 +		}
@@ -515,7 +575,8 @@ index 0000000..aeb20f6
 +			buf = msgs[dev->msg_write_idx].buf;
 +			buf_len = msgs[dev->msg_write_idx].len;
 +
-+			if ((dev->master_cfg & CTC_IC_CON_RESTART_EN) && (dev->msg_write_idx > 0))
++			if ((dev->master_cfg & CTC_IC_CON_RESTART_EN)
++			    && (dev->msg_write_idx > 0))
 +				need_restart = true;
 +		}
 +
@@ -524,11 +585,12 @@ index 0000000..aeb20f6
 +
 +		while (buf_len > 0 && tx_limit > 0 && rx_limit > 0) {
 +			u32 cmd = 0;
-+			
++
 +			/* set the stop bit */
-+			if (dev->msg_write_idx == dev->msgs_num - 1 && buf_len == 1)
++			if (dev->msg_write_idx == dev->msgs_num - 1
++			    && buf_len == 1)
 +				cmd |= BIT(9);
-+			
++
 +			/* set the restart bit */
 +			if (need_restart) {
 +				cmd |= BIT(10);
@@ -539,12 +601,12 @@ index 0000000..aeb20f6
 +				if (rx_limit - dev->rx_outstanding <= 0)
 +					break;
 +
-+				ctc_writel(dev, cmd | CTC_CMD_READ, CTC_IC_DATA_CMD); /* 1 = Read */
++				ctc_writel(dev, cmd | CTC_CMD_READ, CTC_IC_DATA_CMD);	/* 1 = Read */
 +				rx_limit--;
 +				dev->rx_outstanding++;
 +			} else
 +				ctc_writel(dev, cmd | *buf++, CTC_IC_DATA_CMD);	/* 0 = Write */
-+			tx_limit--; 
++			tx_limit--;
 +			buf_len--;
 +		}
 +
@@ -565,7 +627,7 @@ index 0000000..aeb20f6
 +	if (dev->msg_err)
 +		intr_mask = 0;
 +
-+	ctc_writel(dev, intr_mask,  CTC_IC_INTR_MASK);
++	ctc_writel(dev, intr_mask, CTC_IC_INTR_MASK);
 +}
 +
 +static void i2c_ctc_read(struct ctc_i2c_dev *dev)
@@ -574,7 +636,7 @@ index 0000000..aeb20f6
 +	int rx_valid;
 +	u32 len;
 +	u8 *buf;
-+	
++
 +	/* msg_read_idx */
 +	for (; dev->msg_read_idx < dev->msgs_num; dev->msg_read_idx++) {
 +
@@ -644,7 +706,8 @@ index 0000000..aeb20f6
 +
 +	enabled = ctc_readl(dev, CTC_IC_ENABLE);
 +	stat = ctc_readl(dev, CTC_IC_RAW_INTR_STAT);
-+	dev_dbg(dev->dev, "%s: enabled=%#x stat=%#x\n", __func__, enabled, stat);
++	dev_dbg(dev->dev, "%s: enabled=%#x stat=%#x\n", __func__, enabled,
++		stat);
 +	if (!enabled || !(stat & ~CTC_IC_INTR_ACTIVITY))
 +		return IRQ_NONE;
 +
@@ -665,7 +728,8 @@ index 0000000..aeb20f6
 +		i2c_ctc_xfer_msg(dev);
 +
 +tx_aborted:
-+	if ((stat & (CTC_IC_INTR_TX_ABRT | CTC_IC_INTR_STOP_DET)) || dev->msg_err)
++	if ((stat & (CTC_IC_INTR_TX_ABRT | CTC_IC_INTR_STOP_DET))
++	    || dev->msg_err)
 +		complete(&dev->cmd_complete);
 +	return IRQ_HANDLED;
 +}
@@ -677,8 +741,12 @@ index 0000000..aeb20f6
 +}
 +
 +static struct i2c_algorithm i2c_ctc_algo = {
-+	.master_xfer	= i2c_ctc_xfer,
-+	.functionality	= i2c_ctc_func,
++	.master_xfer = i2c_ctc_xfer,
++	.functionality = i2c_ctc_func,
++};
++
++static struct i2c_bus_recovery_info i2c_ctc_recovery_info = {
++	.recover_bus = i2c_ctc_recover_bus,
 +};
 +
 +int i2c_ctc_probe(struct ctc_i2c_dev *dev)
@@ -691,18 +759,21 @@ index 0000000..aeb20f6
 +
 +	i2c_ctc_init(dev);
 +
-+	snprintf(adap->name, sizeof(adap->name), "Centec TsingMa SoC's I2C adapter");
++	snprintf(adap->name, sizeof(adap->name),
++		 "Centec TsingMa SoC's I2C adapter");
 +	adap->algo = &i2c_ctc_algo;
++	adap->bus_recovery_info = &i2c_ctc_recovery_info;
 +	adap->dev.parent = dev->dev;
 +	i2c_set_adapdata(adap, dev);
 +
 +	i2c_ctc_disable_intr(dev);
 +	if (dev->xfer_type == CTC_IC_INTERRUPT_TRANSFER) {
-+		ret = devm_request_irq(dev->dev, dev->irq, i2c_ctc_isr, 
-+						IRQF_SHARED | IRQF_COND_SUSPEND,
-+				     	dev_name(dev->dev), dev);
++		ret = devm_request_irq(dev->dev, dev->irq, i2c_ctc_isr,
++				       IRQF_SHARED | IRQF_COND_SUSPEND,
++				       dev_name(dev->dev), dev);
 +		if (ret) {
-+			dev_err(dev->dev, "failure requesting irq %i: %d\n", dev->irq, ret);
++			dev_err(dev->dev, "failure requesting irq %i: %d\n",
++				dev->irq, ret);
 +			return ret;
 +		}
 +	}
@@ -720,7 +791,8 @@ index 0000000..aeb20f6
 +	struct resource *mem;
 +	int irq, ret;
 +	u32 clk_freq, ht;
-+	
++	u32 val;
++
 +	irq = platform_get_irq(pdev, 0);
 +	if (irq < 0)
 +		return irq;
@@ -733,6 +805,15 @@ index 0000000..aeb20f6
 +	dev->base = devm_ioremap_resource(&pdev->dev, mem);
 +	if (IS_ERR(dev->base))
 +		return PTR_ERR(dev->base);
++
++	dev->regmap_base =
++	    syscon_regmap_lookup_by_phandle(pdev->dev.of_node, "ctc,sysctrl");
++	if (IS_ERR(dev->regmap_base))
++		return PTR_ERR(dev->regmap_base);
++
++	regmap_read(dev->regmap_base,
++		    offsetof(struct SysCtl_regs, SysCtlSysRev), &val);
++	dev->soc_ver = ((val == 0x1) ? CTC_REV_TM_1_1 : CTC_REV_TM_1_0);
 +
 +	dev->dev = &pdev->dev;
 +	dev->irq = irq;
@@ -749,29 +830,31 @@ index 0000000..aeb20f6
 +		dev_err(&pdev->dev, "Unsupported this frequency\n");
 +		return -EINVAL;
 +	}
-+	
-+	dev->master_cfg |= CTC_IC_CON_MASTER | CTC_IC_CON_SLAVE_DISABLE | CTC_IC_CON_RESTART_EN;
++
++	dev->master_cfg |=
++	    CTC_IC_CON_MASTER | CTC_IC_CON_SLAVE_DISABLE |
++	    CTC_IC_CON_RESTART_EN;
 +
 +	dev->functionality =
-+		I2C_FUNC_I2C |
-+		I2C_FUNC_10BIT_ADDR |
-+		I2C_FUNC_SMBUS_BYTE |
-+		I2C_FUNC_SMBUS_BYTE_DATA |
-+		I2C_FUNC_SMBUS_WORD_DATA |
-+		I2C_FUNC_SMBUS_I2C_BLOCK;
-+		
++	    I2C_FUNC_I2C |
++	    I2C_FUNC_10BIT_ADDR |
++	    I2C_FUNC_SMBUS_BYTE |
++	    I2C_FUNC_SMBUS_BYTE_DATA |
++	    I2C_FUNC_SMBUS_WORD_DATA | I2C_FUNC_SMBUS_I2C_BLOCK;
++
 +	dev->clk = devm_clk_get(&pdev->dev, NULL);
 +	clk_prepare_enable(dev->clk);
 +
-+	if (!of_property_read_u32(pdev->dev.of_node, "i2c-sda-hold-time-ns", &ht)){
++	if (!of_property_read_u32
++	    (pdev->dev.of_node, "i2c-sda-hold-time-ns", &ht)) {
 +		dev->sda_hold_time = ht / IC_ICK_NS(clk_get_rate(dev->clk));
 +	}
-+	
++
 +	if (of_property_read_bool(pdev->dev.of_node, "i2c-polling-xfer"))
 +		dev->xfer_type = CTC_IC_POLLING_TRANSFER;
 +	else
 +		dev->xfer_type = CTC_IC_INTERRUPT_TRANSFER;
-+	
++
 +	dev->adapter.nr = pdev->id;
 +	adap = &dev->adapter;
 +	adap->owner = THIS_MODULE;
@@ -799,40 +882,43 @@ index 0000000..aeb20f6
 +}
 +
 +static const struct of_device_id ctc_i2c_of_match[] = {
-+	{ .compatible = "ctc,i2c", },
++	{.compatible = "ctc,i2c",},
 +	{},
 +};
++
 +MODULE_DEVICE_TABLE(of, ctc_i2c_of_match);
 +
 +static struct platform_driver ctc_i2c_driver = {
 +	.probe = ctc_i2c_plat_probe,
 +	.remove = ctc_i2c_plat_remove,
-+	.driver		= {
-+		.name	= "i2c_centec",
-+		.of_match_table = of_match_ptr(ctc_i2c_of_match),
-+	},
++	.driver = {
++		   .name = "i2c_centec",
++		   .of_match_table = of_match_ptr(ctc_i2c_of_match),
++		   },
 +};
 +
 +static int __init ctc_i2c_init_driver(void)
 +{
 +	return platform_driver_register(&ctc_i2c_driver);
 +}
++
 +subsys_initcall(ctc_i2c_init_driver);
 +
 +static void __exit ctc_i2c_exit_driver(void)
 +{
 +	platform_driver_unregister(&ctc_i2c_driver);
 +}
++
 +module_exit(ctc_i2c_exit_driver);
 +
 +MODULE_AUTHOR("Centec, Inc.");
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/i2c/busses/i2c-ctc.h b/drivers/i2c/busses/i2c-ctc.h
 new file mode 100644
-index 0000000..5c6d182
+index 0000000..407a719
 --- /dev/null
 +++ b/drivers/i2c/busses/i2c-ctc.h
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,205 @@
 +/*
 + * Author: Wangyb <wangyb@centecnetworks.com>
 + *
@@ -907,7 +993,6 @@ index 0000000..5c6d182
 +#define CTC_IC_INTR_GEN_CALL	0x800
 +
 +#define CTC_IC_INTR_DEFAULT_MASK		(CTC_IC_INTR_RX_FULL | \
-+					 CTC_IC_INTR_TX_EMPTY | \
 +					 CTC_IC_INTR_TX_ABRT | \
 +					 CTC_IC_INTR_STOP_DET)
 +
@@ -961,39 +1046,84 @@ index 0000000..5c6d182
 +#define CTC_IC_STATUS_MA		0x0020
 +#define CTC_IC_STATUS_TFE		0x0004
 +
++#define CTC_IC_DEFAULT_FUNCTIONALITY (I2C_FUNC_I2C |			\
++					I2C_FUNC_SMBUS_BYTE |		\
++					I2C_FUNC_SMBUS_BYTE_DATA |	\
++					I2C_FUNC_SMBUS_WORD_DATA |	\
++					I2C_FUNC_SMBUS_BLOCK_DATA |	\
++					I2C_FUNC_SMBUS_I2C_BLOCK)
++
++#define CTC_IC_INTR_MASTER_MASK		(CTC_IC_INTR_DEFAULT_MASK | \
++					 CTC_IC_INTR_TX_EMPTY)
++
++#define CTC_IC_INTR_SLAVE_MASK		(CTC_IC_INTR_DEFAULT_MASK | \
++					CTC_IC_INTR_RX_DONE | \
++					CTC_IC_INTR_RX_UNDER | \
++					CTC_IC_INTR_RD_REQ)
++
++#define CTC_IC_CON_STOP_DET_IFADDRESSED		0x80
++#define CTC_IC_CON_TX_EMPTY_CTRL	0x100
++#define CTC_IC_CON_RX_FIFO_FULL_HLD_CTRL	0x200
++
++#define CTC_IC_SAR	0x8
++
++#define CTC_IC_STATUS_SLAVE_ACTIVITY	BIT(6)
++
++#define CTC_IC_BUS_CLEAR_EN 	0xb0
++#define CTC_IC_BUS_CLEAR_THRD   0xb4
++
++/*
++ * operation modes
++ */
++#define CTC_IC_MASTER		0
++#define CTC_IC_SLAVE		1
++
 +enum xfer_type_e {
 +	CTC_IC_INTERRUPT_TRANSFER,
 +	CTC_IC_POLLING_TRANSFER
 +};
 +
 +struct ctc_i2c_dev {
-+	struct device		*dev;
-+	void __iomem		*base;
-+	struct completion	cmd_complete;
-+	struct clk		*clk;
-+	struct mutex		lock;
-+	u32			master_cfg;
-+	int			irq;
-+	unsigned int		rx_fifo_depth;
-+	unsigned int		tx_fifo_depth;
-+	struct i2c_adapter	adapter;
-+	struct i2c_msg		*msgs;
-+	int			msgs_num;
-+	int			msg_err;
-+	int			cmd_err;
-+	unsigned int		status;
-+	u32			abort_source;	
-+	int			msg_read_idx;
-+	int			rx_outstanding;
-+	int			msg_write_idx;
-+	u32			tx_buf_len;
-+	u8			*tx_buf;
-+	u32			rx_buf_len;
-+	u8			*rx_buf;
-+	u32			accessor_flags;
-+	u32			functionality;
-+	u32			clk_freq;
-+	u32 		sda_hold_time;
-+	u32 		xfer_type;
++	struct device *dev;
++	void __iomem *base;
++	struct completion cmd_complete;
++	struct clk *clk;
++	struct mutex lock;
++	u32 master_cfg;
++	int irq;
++	unsigned int rx_fifo_depth;
++	unsigned int tx_fifo_depth;
++	struct i2c_adapter adapter;
++	struct i2c_msg *msgs;
++	int msgs_num;
++	int msg_err;
++	int cmd_err;
++	unsigned int status;
++	u32 abort_source;
++	int msg_read_idx;
++	int rx_outstanding;
++	int msg_write_idx;
++	u32 tx_buf_len;
++	u8 *tx_buf;
++	u32 rx_buf_len;
++	u8 *rx_buf;
++	u32 accessor_flags;
++	u32 functionality;
++	u32 clk_freq;
++	u32 sda_hold_time;
++	u32 xfer_type;
++	u32 mode;
++	u32 slave_cfg;
++	void (*disable) (struct ctc_i2c_dev * dev);
++	void (*disable_int) (struct ctc_i2c_dev * dev);
++	int (*init) (struct ctc_i2c_dev * dev);
++	struct i2c_client *slave;
++	struct regmap *regmap_base;
++	u32 soc_ver;
++#define CTC_REV_TM_1_0 0x0
++#define CTC_REV_TM_1_1 0x1
++	u32 i2c_num;
 +};
-+
+-- 
+2.7.4
+

@@ -1,8 +1,20 @@
+From 73cd5a8a4c4bf342985470b47a6294ddab066bff Mon Sep 17 00:00:00 2001
+From: shil <shil@contoso.com>
+Date: Thu, 5 Aug 2021 07:01:28 +0000
+Subject: [PATCH 11/14] [centec][arm64] tsingma soc rtc
+
+---
+ drivers/rtc/Kconfig      |   9 ++
+ drivers/rtc/Makefile     |   1 +
+ drivers/rtc/rtc-sd2405.c | 246 +++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 256 insertions(+)
+ create mode 100644 drivers/rtc/rtc-sd2405.c
+
 diff --git a/drivers/rtc/Kconfig b/drivers/rtc/Kconfig
-index 0723c97..8056670 100644
+index ef850dd..45c5085 100644
 --- a/drivers/rtc/Kconfig
 +++ b/drivers/rtc/Kconfig
-@@ -610,6 +610,15 @@ config RTC_DRV_S5M
+@@ -611,6 +611,15 @@ config RTC_DRV_S5M
  	  This driver can also be built as a module. If so, the module
  	  will be called rtc-s5m.
  
@@ -279,3 +291,6 @@ index 0000000..4a2bba9
 +
 +module_init(sd2405_init);
 +module_exit(sd2405_exit);
+-- 
+2.7.4
+
