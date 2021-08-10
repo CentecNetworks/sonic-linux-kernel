@@ -1,0 +1,266 @@
+From 883f493c2405aca41ea2e6eaf85e4cb59cbf3e0a Mon Sep 17 00:00:00 2001
+From: Shi Lei <shil@centecnetworks.com>
+Date: Wed, 11 Aug 2021 07:06:15 +0000
+Subject: [PATCH 3/3] [centec][arm64] add dts for centec e530 board
+
+---
+ arch/arm64/boot/dts/centec/Makefile         |   1 +
+ arch/arm64/boot/dts/centec/ctc5236.dtsi     |   9 ++
+ arch/arm64/boot/dts/centec/e530-ctc5236.dts | 213 ++++++++++++++++++++++++++++
+ 3 files changed, 223 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/centec/e530-ctc5236.dts
+
+diff --git a/arch/arm64/boot/dts/centec/Makefile b/arch/arm64/boot/dts/centec/Makefile
+index c4c0f63..3f226e2 100644
+--- a/arch/arm64/boot/dts/centec/Makefile
++++ b/arch/arm64/boot/dts/centec/Makefile
+@@ -12,6 +12,7 @@ dtb-$(CONFIG_ARCH_CTC5236) += e530-48s4x-p.dtb
+ dtb-$(CONFIG_ARCH_CTC5236) += e520-8t16x.dtb
+ dtb-$(CONFIG_ARCH_CTC5236) += e520-48t6x.dtb
+ dtb-$(CONFIG_ARCH_CTC5236) += e530-24x2c-tm1_1.dtb
++dtb-$(CONFIG_ARCH_CTC5236) += e530-ctc5236.dtb
+ always		:= $(dtb-y)
+ subdir-y	:= $(dts-dirs)
+ clean-files	:= *.dtb
+diff --git a/arch/arm64/boot/dts/centec/ctc5236.dtsi b/arch/arm64/boot/dts/centec/ctc5236.dtsi
+index 6f2ec99..0562db6 100644
+--- a/arch/arm64/boot/dts/centec/ctc5236.dtsi
++++ b/arch/arm64/boot/dts/centec/ctc5236.dtsi
+@@ -339,6 +339,15 @@
+ 			
+ 			status="disabled";
+ 		};
++
++		fan: fan-ctc5236 {
++		    compatible = "fan-ctc5236";
++		    pwms = <&pwm 0 1000000>,
++		           <&pwm 1 1000000>,
++		           <&pwm 2 1000000>,
++		           <&pwm 3 1000000>;
++		    pwm-names = "pwm1","pwm2","pwm3","pwm4";
++		};
+ 		
+ 		gpio0: gpio@33610000 {
+ 			compatible = "ctc,apb-gpio";
+diff --git a/arch/arm64/boot/dts/centec/e530-ctc5236.dts b/arch/arm64/boot/dts/centec/e530-ctc5236.dts
+new file mode 100644
+index 0000000..0250020
+--- /dev/null
++++ b/arch/arm64/boot/dts/centec/e530-ctc5236.dts
+@@ -0,0 +1,213 @@
++/*
++ * dts file for Centec CTC5236(TsingMa) SoC E530-24X2C Board
++ *
++ * (C) Copyright 2004-2018 Centec Networks (suzhou) Co., LTD.
++ *
++ * liuht <liuht@centecnetworks.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ */
++
++/dts-v1/;
++#include "ctc5236.dtsi"
++
++
++/ {
++	model = " CTC5236(TsingMa) E530 Board";
++	compatible = "ctc5236,e530-ctc5236";
++
++	memory {
++		device_type = "memory";
++		reg = <0 0x80000000 0x0 0x40000000>;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++
++	aliases {
++		serial0 = &serial0;
++		serial1 = &serial1;
++		ethernet0 = &enet0;
++		ethernet1 = &enet1;
++	};
++
++};
++
++&serial0 {
++	status = "okay";
++};
++
++&serial1 {
++	status = "okay";
++};
++
++&mdio {
++	status = "okay";
++    phy0: ethernet-phy@0 {
++		index = <0x00>;
++		reg = <0x00>;
++    };
++};
++
++&enet0 {
++	status = "okay";
++	phy-handle = <&phy0>;
++	auto-nego-mode= "sgmii-mac";
++};
++
++&qspi {
++	status = "okay";	
++		
++	qspiflash: mx25u3235f@0 {
++		compatible = "jedec,spi-nor";
++		reg = <0x0>;
++		spi-cpha; 
++		spi-cpol;
++		spi-max-frequency = <25000000>;
++		
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "u-boot";
++				reg = <0x0 0x300000>;
++				};
++			partition@300000 {
++				label = "uboot-env";
++				reg = <0x300000 0x10000>;
++				};
++			partition@310000 {
++				label = "system";
++				reg = <0x310000 0x10000>;
++				};	
++            partition@320000 {
++                    label = "hw-info";
++                    reg = <0x320000 0x10000>;
++                };
++		};
++	};
++};
++
++&spi {
++	status = "disabled";
++	pinctrl-names = "default";
++	pinctrl-0 = <&spi_pin>;
++
++        clock0: ad9559@1 {
++                compatible = "analog,ad9559";
++                reg = <1>;
++                spi-max-frequency = <25000000>;
++        };
++};
++
++&switch {
++	status = "okay";
++};
++
++&switch1 {
++	status = "okay";
++};
++
++&i2c0{
++	status = "okay";
++	clock-frequency = <400000>;
++	
++	eeprom_0:eeprom_0@57 { 
++		compatible = "atmel,24c64";
++		reg = <0x57>;
++		pagesize = <32>; 
++	};
++		
++	rtc_0:rtc_0@32{
++		compatible = "sd2405";
++		reg = <0x32>;
++	};
++};  
++
++&i2c1{
++	status = "okay";
++	clock-frequency = <400000>;
++};  
++
++&ehci0 {
++	status = "okay";
++};
++
++&ohci0 {
++    status = "okay";
++};
++
++&wtd0{
++	status = "okay";
++};
++
++&wtd1{
++	status = "disabled";
++};
++
++&sdhci {
++	bus-width = <8>;
++	max-frequency = <100000000>;
++	non-removable;
++	no-sd;
++	no-sdio;
++	cap-mmc-hw-reset;
++	voltage-ranges = <3300 3300>;	
++	status = "okay";
++};
++
++&timer0 {
++	status = "okay";
++};
++
++&soc {
++        ctc-irq@0 {
++                compatible = "centec,ctc-irq";
++                device_type = "ctc-irq";
++                interrupt-parent=<&porta>;
++                interrupts = < 0 IRQ_TYPE_LEVEL_LOW>,
++                	      < 1 IRQ_TYPE_LEVEL_LOW>,
++                          <15 IRQ_TYPE_LEVEL_LOW>,
++                          < 6 IRQ_TYPE_LEVEL_HIGH>,
++                	      < 7 IRQ_TYPE_LEVEL_HIGH>;
++
++        };
++};
++
++&pwm {
++	pinctrl-names = "default";
++	pinctrl-0 = <&pwm0_pin>;
++	status = "okay";
++};
++
++
++&pinctrl {
++	spi {
++		spi_pin: spi_pin {
++			status = "disabled";
++			ctc,pins = <0 0 PIN_FUNC_SPI>,
++				   <0 2 PIN_FUNC_SPI>,
++				   <0 3 PIN_FUNC_SPI>,
++				   <0 5 PIN_FUNC_SPI>;
++		};
++	};
++
++	pwm0 {
++		pwm0_pin: pwm0_pin {
++			ctc,pins = <0 8  PIN_FUNC_PWM>,
++  				   <0 9  PIN_FUNC_PWM>,
++				   <0 10 PIN_FUNC_PWM>,
++				   <0 11 PIN_FUNC_PWM>,
++				   <0 12 PIN_FUNC_PWM>,
++				   <0 13 PIN_FUNC_PWM>,
++				   <0 14 PIN_FUNC_PWM>,
++				   <0 15 PIN_FUNC_PWM>;
++		};
++	};
++};
+-- 
+2.7.4
+
