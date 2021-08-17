@@ -82,6 +82,12 @@ net-sch_generic-fix-the-missing-new-qdisc-assignment.patch
 0030-hwmon-Add-convience-macro-to-define-simple-static-se.patch
 0031-backport-nvme-Add-hardware-monitoring-support.patch
 0032-platform-mellanox-mlxreg-hotplug-Use-capability-regi.patch
+# Centec patches for 4.19
+0001-mmc-sdhci-add-adma_table_cnt-member-to-struct-sdhci_.patch
+0002-mmc-sdhci-introduce-adma_write_desc-hook-to-struct-s.patch
+0003-mmc-sdhci-of-dwcmshc-solve-128MB-DMA-boundary-limita.patch
+0001-mmc-sdhci-fix-__sdhci_adma_write_desc.patch
+0001-fea-support-arm64-kexec-with-spin-table.patch
 ############################################################
 #
 # Internal patches will be added below (placeholder)
