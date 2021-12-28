@@ -1,0 +1,31 @@
+From c68c4a947a5c87dffeb57dfe0ec5b0d5fef9faf5 Mon Sep 17 00:00:00 2001
+From: liuht <liuht@centecnetworks.com>
+Date: Wed, 22 Dec 2021 14:32:02 +0800
+Subject: [PATCH 2/2] fix:Set IGNORE_ANEG_ERR and IGNORE_LINK_FAILURE
+
+Set IGNORE_ANEG_ERR and IGNORE_LINK_FAILURE
+
+close #129
+---
+ drivers/net/ethernet/centec/ctcmac.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/net/ethernet/centec/ctcmac.c b/drivers/net/ethernet/centec/ctcmac.c
+index 078d1c5c0..12b8688da 100644
+--- a/drivers/net/ethernet/centec/ctcmac.c
++++ b/drivers/net/ethernet/centec/ctcmac.c
+@@ -1111,6 +1111,11 @@ static void ctcmac_hw_init(struct ctcmac_private *priv)
+ 		val |= (priv->autoneg_mode<<2 | BIT(CPU_MAC_SGMII_AUTO_NEG_CFG_W0_CFG_AN_ENABLE_BIT));
+ 		writel(val, &priv->cpumac_reg->CpuMacSgmiiAutoNegCfg);
+ 	}
++	clrsetbits(&priv->cpumac_reg->CpuMacSgmiiAutoNegCfg, 
++			0, BIT(CPU_MAC_SGMII_AUTO_NEG_CFG_W0_CFG_IGNORE_ANEG_ERR_BIT));
++	clrsetbits(&priv->cpumac_reg->CpuMacSgmiiAutoNegCfg, 
++			0, BIT(CPU_MAC_SGMII_AUTO_NEG_CFG_W0_CFG_IGNORE_LINK_FAILURE_BIT));
++
+ 	/* disable rx link filter */
+ 	clrsetbits(&priv->cpumac_reg->CpuMacSgmiiCfg[0], 
+ 	    BIT(CPU_MAC_SGMII_CFG_W0_CFG_MII_RX_LINK_FILTER_EN_BIT), 0);
+-- 
+2.17.1
+
