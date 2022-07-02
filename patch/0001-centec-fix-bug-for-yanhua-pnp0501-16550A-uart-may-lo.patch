@@ -1,0 +1,27 @@
+From cb6316624230e2cd15a9b370f7dae721f4de42cb Mon Sep 17 00:00:00 2001
+From: Shi Lei <shil@centecnetworks.com>
+Date: Sat, 2 Jul 2022 08:30:11 +0000
+Subject: [PATCH] [centec] fix bug for yanhua pnp0501 16550A uart may lose
+ interrupt
+
+---
+ drivers/tty/serial/8250/8250_port.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index 60ca19eca..3fbcc08e2 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -3121,6 +3121,9 @@ static void serial8250_config_port(struct uart_port *port, int flags)
+ 	if (port->type != PORT_UNKNOWN && flags & UART_CONFIG_IRQ)
+ 		autoconfig_irq(up);
+ 
++	/* Centec: fix bug for yanhua pnp0501 16550A uart may lose interrupt */
++	up->port.irq = 0;
++
+ 	if (port->type == PORT_UNKNOWN)
+ 		serial8250_release_std_resource(up);
+ 
+-- 
+2.25.1
+
