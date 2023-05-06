@@ -1,0 +1,141 @@
+From a2d98d789675f16dcb43ce01901a81b7dd8e7cab Mon Sep 17 00:00:00 2001
+From: qianj <qianj@centec.com>
+Date: Sat, 6 May 2023 02:08:42 +0000
+Subject: [PATCH] [centec][arm64] upgrade tsingma soc support to cldk V22.04
+
+---
+ arch/arm64/boot/dts/centec/ctc5236.dtsi    |  2 +-
+ drivers/mtd/spi-nor/spi-nor.c              |  2 ++
+ drivers/net/ethernet/centec/ctc5236_mdio.c | 36 +++++++++++++---------
+ drivers/net/ethernet/centec/ctcmac.c       |  6 ++--
+ 4 files changed, 28 insertions(+), 18 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/centec/ctc5236.dtsi b/arch/arm64/boot/dts/centec/ctc5236.dtsi
+index 0562db60..b57281b1 100644
+--- a/arch/arm64/boot/dts/centec/ctc5236.dtsi
++++ b/arch/arm64/boot/dts/centec/ctc5236.dtsi
+@@ -183,7 +183,7 @@
+ 			compatible = "generic-ohci";
+ 			reg = <0x0 0x30580000 0x0 0x1000>;
+ 			interrupts = <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH>;
+-			status = "disabled";
++			status = "okay";
+ 		};
+ 		
+ 		spi: spi@33100000 {
+diff --git a/drivers/mtd/spi-nor/spi-nor.c b/drivers/mtd/spi-nor/spi-nor.c
+index b9da51b3..f639bf2e 100644
+--- a/drivers/mtd/spi-nor/spi-nor.c
++++ b/drivers/mtd/spi-nor/spi-nor.c
+@@ -861,6 +861,8 @@ static const struct flash_info spi_nor_ids[] = {
+             SPI_NOR_HAS_LOCK | SPI_NOR_HAS_TB)
+ 	},
+ 
++	{ "gd25wq32e",  INFO(0xc86516, 0, 64 * 1024,  64, SECT_4K) },
++
+ 	/* Intel/Numonyx -- xxxs33b */
+ 	{ "160s33b",  INFO(0x898911, 0, 64 * 1024,  32, 0) },
+ 	{ "320s33b",  INFO(0x898912, 0, 64 * 1024,  64, 0) },
+diff --git a/drivers/net/ethernet/centec/ctc5236_mdio.c b/drivers/net/ethernet/centec/ctc5236_mdio.c
+index 8729c0e3..ec143e52 100644
+--- a/drivers/net/ethernet/centec/ctc5236_mdio.c
++++ b/drivers/net/ethernet/centec/ctc5236_mdio.c
+@@ -56,8 +56,9 @@ static int ctc_mdio_write(struct mii_bus *bus, int mii_id, int reg,
+ {
+     int ret = 0;
+     u32 cmd = 0;
+-    u32 tmp = 0;
++    u32 status = 0;
+     struct ctc_mdio_priv *priv = (struct ctc_mdio_priv *)bus->priv;
++    unsigned long start_time;
+ 
+     cmd = CTCMAC_MDIO_CMD_REGAD(reg) | CTCMAC_MDIO_CMD_PHYAD(mii_id) 
+         | CTCMAC_MDIO_CMD_OPCODE(1) | CTCMAC_MDIO_CMD_DATA(value);
+@@ -65,12 +66,15 @@ static int ctc_mdio_write(struct mii_bus *bus, int mii_id, int reg,
+     writel(cmd, &priv->mdio_reg->MdioSocCmd0[0]);    
+     writel(1, &priv->mdio_reg->MdioSocCmd0[1]);
+     
+-    ret = readl_poll_timeout(&priv->mdio_reg->MdioSocStatus0, 
+-        tmp, tmp & CTCMAC_MDIO_STAT(1), 1000, 10000); 
+-    
+-    if(ret < 0)
+-    {
+-        return -1;
++    start_time = jiffies;
++    while(1) {
++	    status = readl(&priv->mdio_reg->MdioSocStatus0);
++	    if (time_after(jiffies, start_time + 250)) {
++		    return -1;
++	    }
++	    else if (status & CTCMAC_MDIO_STAT(1)) {
++		    break;
++	    }
+     }
+ 
+     return 0;
+@@ -83,7 +87,7 @@ static int ctc_mdio_read(struct mii_bus *bus, int mii_id, int reg)
+     u32 status;
+     int value = 0;
+     struct ctc_mdio_priv *priv = (struct ctc_mdio_priv *)bus->priv;
+-
++    unsigned long start_time;
+ 
+ 
+     cmd = CTCMAC_MDIO_CMD_REGAD(reg) | CTCMAC_MDIO_CMD_PHYAD(mii_id) 
+@@ -92,12 +96,16 @@ static int ctc_mdio_read(struct mii_bus *bus, int mii_id, int reg)
+     writel(cmd, &priv->mdio_reg->MdioSocCmd0[0]);    
+     writel(1, &priv->mdio_reg->MdioSocCmd0[1]);
+     
+-    ret = readl_poll_timeout(&priv->mdio_reg->MdioSocStatus0, 
+-        status, status & CTCMAC_MDIO_STAT(1), 1000, 10000);
+-    if(ret < 0)
+-    {
+-    	printk(KERN_ERR "ctc_mdio_read1\n");
+-        return -1;
++    start_time = jiffies;
++    while(1) {
++	    status = readl(&priv->mdio_reg->MdioSocStatus0);
++	    if (time_after(jiffies, start_time + 250)) {
++		    printk(KERN_ERR "ctc_mdio_read1\n");
++		    return -1;
++	    }
++	    else if (status & CTCMAC_MDIO_STAT(1)) {
++		    break;
++	    }
+     }
+ 
+     value = (readl(&priv->mdio_reg->MdioSocStatus0) & 0xffff);
+diff --git a/drivers/net/ethernet/centec/ctcmac.c b/drivers/net/ethernet/centec/ctcmac.c
+index 12b8688d..71164311 100644
+--- a/drivers/net/ethernet/centec/ctcmac.c
++++ b/drivers/net/ethernet/centec/ctcmac.c
+@@ -286,7 +286,7 @@ static int ctcmac_of_init(struct platform_device *ofdev, struct net_device **pde
+ 	priv->dev->coherent_dma_mask = DMA_BIT_MASK(64);
+ 	priv->num_tx_queues = num_tx_qs;
+ 	regmap_read(regmap_base, offsetof(struct SysCtl_regs, SysCtlSysRev), &val);
+-	priv->version = val;
++	priv->version = 0;
+ 	netif_set_real_num_rx_queues(dev, num_rx_qs);
+ 	priv->num_rx_queues = num_rx_qs;
+ 
+@@ -727,7 +727,7 @@ static int ctcmac_maximize_margin_of_cmu_tempearture_ramp(struct ctcmac_private
+ 	 /*for temperature -40~-20C, try (ctune-1) if (ctune-2) causes lol*/
+ 	mdelay(10);
+ 	 /*pll_lol_udl        0xe0[4]   read 0*/
+-	val = ctc_mac_hss_read(priv, 0xe0, &val, 2);
++	ctc_mac_hss_read(priv, 0xe0, &val, 2);
+ 	if((0 != (val & BIT(4))) && (delta == 2)){
+ 		/*cfg_vco_byp_ctune  0x07[3:0] write (ctune - 1)*/
+ 		ctune_cal = ctune - 1;
+@@ -739,7 +739,7 @@ static int ctcmac_maximize_margin_of_cmu_tempearture_ramp(struct ctcmac_private
+ 	/*check pll lol*/
+ 	mdelay(10);
+ 	/*pll_lol_udl        0xe0[4]   read 0*/
+-	val = ctc_mac_hss_read(priv, 0xe0, &val, 2);
++	ctc_mac_hss_read(priv, 0xe0, &val, 2);
+ 	if(0 != (val & BIT(4))){
+ 		printk(KERN_ERR"maximize margin of cmu tempearture ramp fail!\n");
+ 		return -1;
+-- 
+2.25.1
+
