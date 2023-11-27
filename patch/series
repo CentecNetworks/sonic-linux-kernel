@@ -107,6 +107,14 @@ cisco-npu-disable-other-bars.patch
 #
 # Marvell platform patches for 4.19
 armhf_secondary_boot_online.patch
+
+# Centec patches for 4.19
+0001-mmc-sdhci-add-adma_table_cnt-member-to-struct-sdhci_.patch
+0002-mmc-sdhci-introduce-adma_write_desc-hook-to-struct-s.patch
+0003-mmc-sdhci-of-dwcmshc-solve-128MB-DMA-boundary-limita.patch
+0001-mmc-sdhci-fix-__sdhci_adma_write_desc.patch
+0001-fea-support-arm64-kexec-with-spin-table.patch
+
 ############################################################
 #
 # Internal patches will be added below (placeholder)

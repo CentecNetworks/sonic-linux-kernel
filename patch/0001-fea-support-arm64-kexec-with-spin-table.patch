@@ -1,0 +1,214 @@
+From 1ff6a1cb07b25db88a9aa993eab21904006bbee7 Mon Sep 17 00:00:00 2001
+From: shil <shil@centecnetworks.com>
+Date: Sat, 14 Aug 2021 00:53:35 +0800
+Subject: [PATCH] fea support arm64 kexec with spin table
+
+---
+ arch/arm64/kernel/Makefile         |  2 +-
+ arch/arm64/kernel/cpu-park.S       | 56 ++++++++++++++++++++++++++++++
+ arch/arm64/kernel/cpu-park.h       | 29 ++++++++++++++++
+ arch/arm64/kernel/smp_spin_table.c | 46 +++++++++++++++++++-----
+ 4 files changed, 124 insertions(+), 9 deletions(-)
+ create mode 100644 arch/arm64/kernel/cpu-park.S
+ create mode 100644 arch/arm64/kernel/cpu-park.h
+
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 4c8b13bed..973932b4f 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -19,7 +19,7 @@ arm64-obj-y		:= debug-monitors.o entry.o irq.o fpsimd.o		\
+ 			   return_address.o cpuinfo.o cpu_errata.o		\
+ 			   cpufeature.o alternative.o cacheinfo.o		\
+ 			   smp.o smp_spin_table.o topology.o smccc-call.o	\
+-			   syscall.o
++			   syscall.o cpu-park.o
+ 
+ extra-$(CONFIG_EFI)			:= efi-entry.o
+ 
+diff --git a/arch/arm64/kernel/cpu-park.S b/arch/arm64/kernel/cpu-park.S
+new file mode 100644
+index 000000000..9a68a50ff
+--- /dev/null
++++ b/arch/arm64/kernel/cpu-park.S
+@@ -0,0 +1,56 @@
++/*
++ * cpu park routines
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/linkage.h>
++#include <asm/assembler.h>
++#include <asm/sysreg.h>
++#include <asm/virt.h>
++
++.text
++.pushsection 	.idmap.text, "ax"
++
++/*
++ * __cpu_park(el2_switch, park_address) - Helper for cpu_park
++ *
++ * @el2_switch: Flag to indicate a swich to EL2 is needed, passed to cpu_park.
++ * @park_address - where cpu will keep on looking for address to jump
++ *
++ * Put the CPU into the wfe and check for valid none zero secondary address
++ * at parked address when a event is received. If secondary address is
++ * valid then jump to it.
++ */
++
++ENTRY(__cpu_park)
++	/* Clear sctlr_el1 flags. */
++	mrs	x12, sctlr_el1
++	ldr	x13, =SCTLR_ELx_FLAGS
++	bic	x12, x12, x13
++	msr	sctlr_el1, x12
++	isb
++	mov	x3, 0
++	str	x3, [x1]
++1:
++	wfe
++	ldr	x2, [x1]
++	cmp	x2, #0
++	b.eq	1b
++
++	mov	x3, 0
++	str	x3, [x1]
++
++	cbz	x0, 2f				// el2_switch?
++
++	mov	x0, x2				// entry
++	hvc	#0			// no return
++
++2:
++	ret	x2
++
++ENDPROC(__cpu_park)
++
++.popsection
+\ No newline at end of file
+diff --git a/arch/arm64/kernel/cpu-park.h b/arch/arm64/kernel/cpu-park.h
+new file mode 100644
+index 000000000..4f012bd7b
+--- /dev/null
++++ b/arch/arm64/kernel/cpu-park.h
+@@ -0,0 +1,29 @@
++/*
++ * cpu park routines
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#if !defined(_ARM64_CPU_PARK_H)
++#define _ARM64_CPU_PARK_H
++
++#include <asm/virt.h>
++#ifdef CONFIG_CRASH_DUMP
++#include <linux/kexec.h>
++#endif
++
++void __cpu_park(unsigned long el2_switch, unsigned long park_address);
++
++static inline void __noreturn cpu_park(unsigned long el2_switch,
++					unsigned long park_address)
++{
++	typeof(__cpu_park) *park_fn;
++
++	park_fn = (void *)virt_to_phys(__cpu_park);
++	park_fn(el2_switch, park_address);
++	unreachable();
++}
++
++#endif
+diff --git a/arch/arm64/kernel/smp_spin_table.c b/arch/arm64/kernel/smp_spin_table.c
+index 93034651c..9dc7af150 100644
+--- a/arch/arm64/kernel/smp_spin_table.c
++++ b/arch/arm64/kernel/smp_spin_table.c
+@@ -27,8 +27,12 @@
+ #include <asm/cpu_ops.h>
+ #include <asm/cputype.h>
+ #include <asm/io.h>
++#include <asm/kexec.h>
++#include <asm/mmu_context.h>
+ #include <asm/smp_plat.h>
+ 
++#include "cpu-park.h"
++
+ extern void secondary_holding_pen(void);
+ volatile unsigned long __section(".mmuoff.data.read")
+ secondary_holding_pen_release = INVALID_HWID;
+@@ -76,11 +80,14 @@ static int smp_spin_table_cpu_init(unsigned int cpu)
+ 
+ static int smp_spin_table_cpu_prepare(unsigned int cpu)
+ {
+-	__le64 __iomem *release_addr;
+-
+ 	if (!cpu_release_addr[cpu])
+ 		return -ENODEV;
++	return 0;
++}
+ 
++static int smp_spin_table_cpu_boot(unsigned int cpu)
++{
++	__le64 __iomem *release_addr;
+ 	/*
+ 	 * The cpu-release-addr may or may not be inside the linear mapping.
+ 	 * As ioremap_cache will either give us a new mapping or reuse the
+@@ -109,12 +116,7 @@ static int smp_spin_table_cpu_prepare(unsigned int cpu)
+ 	sev();
+ 
+ 	iounmap(release_addr);
+-
+-	return 0;
+-}
+-
+-static int smp_spin_table_cpu_boot(unsigned int cpu)
+-{
++	
+ 	/*
+ 	 * Update the pen release flag.
+ 	 */
+@@ -128,9 +130,37 @@ static int smp_spin_table_cpu_boot(unsigned int cpu)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_HOTPLUG_CPU
++static int smp_spin_table_cpu_disable(unsigned int cpu)
++{
++	if (!cpu_release_addr[cpu])
++		return -EOPNOTSUPP;
++
++	return 0;
++}
++
++static void smp_spin_table_cpu_die(unsigned int cpu)
++{
++	cpu_install_idmap();
++#ifdef CONFIG_CRASH_DUMP
++	cpu_park(kexec_crash_loaded() ? 0 : is_hyp_mode_available(),
++			cpu_release_addr[cpu]);
++#else
++	cpu_park(is_hyp_mode_available(),
++			cpu_release_addr[cpu]);
++#endif
++
++	pr_crit("unable to power off CPU%u\n", cpu);
++}
++#endif
++
+ const struct cpu_operations smp_spin_table_ops = {
+ 	.name		= "spin-table",
+ 	.cpu_init	= smp_spin_table_cpu_init,
+ 	.cpu_prepare	= smp_spin_table_cpu_prepare,
+ 	.cpu_boot	= smp_spin_table_cpu_boot,
++#ifdef CONFIG_HOTPLUG_CPU
++	.cpu_disable	= smp_spin_table_cpu_disable,
++	.cpu_die	= smp_spin_table_cpu_die,
++#endif
+ };
+-- 
+2.17.1
+
