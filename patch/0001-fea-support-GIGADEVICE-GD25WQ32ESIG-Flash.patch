@@ -1,0 +1,25 @@
+From 23397951ff39c52a9b21cf4c677c71aac4a934cb Mon Sep 17 00:00:00 2001
+From: qianj <qianj@centec.com>
+Date: Fri, 28 Apr 2023 03:25:39 +0000
+Subject: [PATCH] fea support GIGADEVICE GD25WQ32ESIG Flash
+
+---
+ drivers/mtd/spi-nor/spi-nor.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/mtd/spi-nor/spi-nor.c b/drivers/mtd/spi-nor/spi-nor.c
+index ff641c060..a79632c7f 100644
+--- a/drivers/mtd/spi-nor/spi-nor.c
++++ b/drivers/mtd/spi-nor/spi-nor.c
+@@ -1050,7 +1050,7 @@ static const struct flash_info spi_nor_ids[] = {
+ 			SPI_NOR_4B_OPCODES | SPI_NOR_HAS_LOCK | SPI_NOR_HAS_TB)
+ 			.quad_enable = macronix_quad_enable,
+ 	},
+-
++	{ "gd25wq32e",  INFO(0xc86516, 0, 64 * 1024, 64, SECT_4K) },
+ 	/* Intel/Numonyx -- xxxs33b */
+ 	{ "160s33b",  INFO(0x898911, 0, 64 * 1024,  32, 0) },
+ 	{ "320s33b",  INFO(0x898912, 0, 64 * 1024,  64, 0) },
+-- 
+2.25.1
+
