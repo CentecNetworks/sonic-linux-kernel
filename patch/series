@@ -288,6 +288,8 @@ armhf_secondary_boot_online.patch
 0029-arm64-traps-Handle-SError-interrupt.patch
 0030-quirks-for-the-Pensando-qspi-controller.patch
 
+# Centec Hygon cpu adapt patch
+0001-centec-support-hygon-cpu-C3330.patch
 # Security patch
 0001-Change-the-system.map-file-permission-only-readable-.patch
 
