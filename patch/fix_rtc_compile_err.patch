@@ -1,0 +1,29 @@
+diff --git a/drivers/rtc/rtc-ins5902b.c b/drivers/rtc/rtc-ins5902b.c
+index 63fb357ea..b4728659b 100755
+--- a/drivers/rtc/rtc-ins5902b.c
++++ b/drivers/rtc/rtc-ins5902b.c
+@@ -186,11 +186,12 @@ static int ins5902b_rtc_set_time(struct device *dev, struct rtc_time *tm)
+ 
+ static int ins5902b_remove(struct i2c_client *client)
+ {
++#if 0
+ 	struct rtc_device *rtc = i2c_get_clientdata(client);
+ 
+ 	if (rtc)
+ 		rtc_device_unregister(rtc);
+-
++#endif
+ 	return 0;
+ }
+ 
+@@ -241,8 +242,8 @@ ins5902b_probe(struct i2c_client *client, const struct i2c_device_id *id)
+ 
+ 	dev_info(&client->dev, "chip found, driver version " DRV_VERSION "\n");
+ 
+-	rtc = rtc_device_register(ins5902b_driver.driver.name,
+-				  &client->dev, &ins5902b_rtc_ops, THIS_MODULE);
++	rtc = devm_rtc_device_register(&client->dev,ins5902b_driver.driver.name,
++				  &ins5902b_rtc_ops, THIS_MODULE);
+ 	if (IS_ERR(rtc))
+ 		return PTR_ERR(rtc);
+ 

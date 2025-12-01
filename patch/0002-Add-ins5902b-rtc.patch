@@ -1,0 +1,340 @@
+From 8daec810c2f8e0648195e90019df707b6d902728 Mon Sep 17 00:00:00 2001
+From: qianj <qianj@centec.com>
+Date: Tue, 23 Sep 2025 11:29:48 +0800
+Subject: [PATCH 2/6] Add ins5902b rtc
+
+---
+ drivers/rtc/Kconfig        |   9 ++
+ drivers/rtc/Makefile       |   1 +
+ drivers/rtc/rtc-ins5902b.c | 290 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 300 insertions(+)
+ create mode 100755 drivers/rtc/rtc-ins5902b.c
+
+diff --git a/drivers/rtc/Kconfig b/drivers/rtc/Kconfig
+index 8ddd334e0..044aa0184 100644
+--- a/drivers/rtc/Kconfig
++++ b/drivers/rtc/Kconfig
+@@ -269,6 +269,15 @@ config RTC_DRV_DS1307_CENTURY
+ 	  To solve that, you could boot a kernel without this option set, set
+ 	  the RTC date and then boot a kernel with this option set.
+ 
++config RTC_DRV_INS5902B
++        tristate "DaPu Technology Inc. INS5902B RTC"
++        help
++          If you say yes here you get support for the DaPu Technology
++          Inc. INS5902B RTC chip.
++
++          This driver can also be built as a module. If so, the module
++          will be called rtc-ins5902b.
++
+ config RTC_DRV_DS1374
+ 	tristate "Dallas/Maxim DS1374"
+ 	help
+diff --git a/drivers/rtc/Makefile b/drivers/rtc/Makefile
+index bfb574641..e6d5e26df 100644
+--- a/drivers/rtc/Makefile
++++ b/drivers/rtc/Makefile
+@@ -183,3 +183,4 @@ obj-$(CONFIG_RTC_DRV_WM8350)	+= rtc-wm8350.o
+ obj-$(CONFIG_RTC_DRV_X1205)	+= rtc-x1205.o
+ obj-$(CONFIG_RTC_DRV_XGENE)	+= rtc-xgene.o
+ obj-$(CONFIG_RTC_DRV_ZYNQMP)	+= rtc-zynqmp.o
++obj-$(CONFIG_RTC_DRV_INS5902B)  += rtc-ins5902b.o
+diff --git a/drivers/rtc/rtc-ins5902b.c b/drivers/rtc/rtc-ins5902b.c
+new file mode 100755
+index 000000000..63fb357ea
+--- /dev/null
++++ b/drivers/rtc/rtc-ins5902b.c
+@@ -0,0 +1,290 @@
++/*
++ * rtc class driver for the INS5902B chip
++ *
++ * Author: Dale Farnsworth <dale@farnsworth.org>
++ *
++ * based on previously existing rtc class drivers
++ *
++ * 2007 (c) MontaVista, Software, Inc.  This file is licensed under
++ * the terms of the GNU General Public License version 2.  This program
++ * is licensed "as is" without any warranty of any kind, whether express
++ * or implied.
++ */
++
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/bcd.h>
++#include <linux/rtc.h>
++#include <linux/delay.h>
++
++#define DRV_VERSION "0.1"
++
++/*
++ * register indices
++ */
++#define INS5902B_REG_SC			0x0	    /* seconds      00-59 */
++#define INS5902B_REG_MN			0x1	    /* minutes      00-59 */
++#define INS5902B_REG_HR			0x2	    /* hours        00-23 */
++#define INS5902B_REG_DW			0x3	    /* day of week   1-7  */
++#define INS5902B_REG_DT			0x4	    /* day of month 00-31 */
++#define INS5902B_REG_MO			0x5	    /* month        01-12 */
++#define INS5902B_REG_YR			0x6	    /* year         00-99 */
++
++#define INS5902B_REG_DEVICE_ID  0x20	/* device id     0x2d */
++
++#define INS5902B_REG_LEN	    7
++
++#define INS5902B_IDLE_TIME_AFTER_WRITE	3	/* specification says 2.5 mS */
++
++static struct i2c_driver ins5902b_driver;
++
++static int ins5902b_i2c_read_regs(struct i2c_client *client, uint8_t off, u8 *buf)
++{
++	struct i2c_msg msgs[] = {
++		{
++		 .addr = client->addr,
++		 .flags = 0, /* write */
++		 .len = 1,
++		 .buf = &off  /* reg address */
++		},
++		{
++		 .addr = client->addr,
++		 .flags = I2C_M_RD,	/* read */
++		 .len = INS5902B_REG_LEN,
++		 .buf = buf
++		}
++	};
++	int rc;
++
++	rc = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (rc != ARRAY_SIZE(msgs)) {
++		dev_err(&client->dev, "%s: register read failed\n", __func__);
++		return -EIO;
++	}
++	return 0;
++}
++
++static int ins5902b_i2c_write_regs(struct i2c_client *client, uint8_t off, u8 const *buf)
++{
++	int rc;
++
++    u8 temp_reg[INS5902B_REG_LEN+1] = {0};
++	temp_reg[0] = off;
++    memcpy(&temp_reg[1], buf, INS5902B_REG_LEN);
++    
++	struct i2c_msg msgs[1] = {
++		{
++		 .addr = client->addr,
++		 .flags = 0,	/* write */
++		 .len = INS5902B_REG_LEN+1,
++		 .buf = temp_reg}
++	};
++
++	rc = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (rc != ARRAY_SIZE(msgs))
++		goto write_failed;
++	msleep(INS5902B_IDLE_TIME_AFTER_WRITE);
++
++	return 0;
++
++ write_failed:
++	dev_err(&client->dev, "%s: register write failed\n", __func__);
++	return -EIO;
++}
++
++static int ins5902b_i2c_read_time(struct i2c_client *client, struct rtc_time *tm)
++{
++	int rc;
++	u8 regs[INS5902B_REG_LEN];
++    int i = 0;
++
++	rc = ins5902b_i2c_read_regs(client, 0, regs);
++	if (rc < 0)
++		return rc;
++
++    if ((regs[INS5902B_REG_MO] < 0x1) || (regs[INS5902B_REG_MO] > 0x12) /*month 01~12*/
++       || (regs[INS5902B_REG_DT] < 0x1) || (regs[INS5902B_REG_DT] > 0x31)  /*day 01~31*/
++       || (regs[INS5902B_REG_DW] > 0x40) /*week 0~6*/
++       || ((regs[INS5902B_REG_HR] & 0x3f) > 0x23) /*hour 0~23*/
++       || (regs[INS5902B_REG_MN] > 0x59) /*min 0~59*/
++       || (regs[INS5902B_REG_SC] > 0x59)) /*sec 0~59*/
++    {
++        dev_info(&client->dev, "set time 2001-01-01 \n");
++        memset(regs, 0x1, INS5902B_REG_LEN); 
++    }
++
++	switch (regs[INS5902B_REG_DW] & 0x7f)
++	{
++		case 0x01:
++			regs[INS5902B_REG_DW] = 0x00;
++			break;
++		case 0x02:
++			regs[INS5902B_REG_DW] = 0x01;
++			break;
++		case 0x04:
++			regs[INS5902B_REG_DW] = 0x02;
++			break;
++		case 0x08:
++			regs[INS5902B_REG_DW] = 0x03;
++			break;
++		case 0x10:
++			regs[INS5902B_REG_DW] = 0x04;
++			break;
++		case 0x20:
++			regs[INS5902B_REG_DW] = 0x05;
++			break;
++		case 0x40:
++			regs[INS5902B_REG_DW] = 0x06;
++			break;
++		default:
++			return 0;
++			break;
++	}
++	tm->tm_sec = bcd2bin(regs[INS5902B_REG_SC]);
++	tm->tm_min = bcd2bin(regs[INS5902B_REG_MN]);
++	tm->tm_hour = bcd2bin(regs[INS5902B_REG_HR] & 0x3f);
++	tm->tm_wday = bcd2bin(regs[INS5902B_REG_DW]);
++	tm->tm_mday = bcd2bin(regs[INS5902B_REG_DT]);
++	tm->tm_mon = bcd2bin(regs[INS5902B_REG_MO]) - 1;
++	tm->tm_year = bcd2bin(regs[INS5902B_REG_YR]) + 100;
++
++	return 0;
++}
++
++static int
++ins5902b_i2c_set_time(struct i2c_client *client, struct rtc_time const *tm)
++{
++	u8 regs[INS5902B_REG_LEN];
++	int rc;
++
++	regs[INS5902B_REG_SC] = bin2bcd(tm->tm_sec);
++	regs[INS5902B_REG_MN] = bin2bcd(tm->tm_min);
++	regs[INS5902B_REG_HR] = bin2bcd(tm->tm_hour);
++	regs[INS5902B_REG_DW] = bin2bcd(tm->tm_wday);
++	regs[INS5902B_REG_DT] = bin2bcd(tm->tm_mday);
++	regs[INS5902B_REG_MO] = bin2bcd(tm->tm_mon + 1);
++	regs[INS5902B_REG_YR] = bin2bcd(tm->tm_year - 100);
++
++	regs[INS5902B_REG_DW] = 0x01 << (tm->tm_wday);
++
++	rc = ins5902b_i2c_write_regs(client, 0, regs);
++	if (rc < 0)
++		return rc;
++    
++	return 0;
++}
++
++static int ins5902b_rtc_read_time(struct device *dev, struct rtc_time *tm)
++{
++	return ins5902b_i2c_read_time(to_i2c_client(dev), tm);
++}
++
++static int ins5902b_rtc_set_time(struct device *dev, struct rtc_time *tm)
++{
++	return ins5902b_i2c_set_time(to_i2c_client(dev), tm);
++}
++
++static int ins5902b_remove(struct i2c_client *client)
++{
++	struct rtc_device *rtc = i2c_get_clientdata(client);
++
++	if (rtc)
++		rtc_device_unregister(rtc);
++
++	return 0;
++}
++
++static const struct rtc_class_ops ins5902b_rtc_ops = {
++	.read_time = ins5902b_rtc_read_time,
++	.set_time = ins5902b_rtc_set_time,
++};
++
++/* bugid:64551; the patch is based on 
++   AN5001 V1.03-2023-0325 provided by manufacturer */
++static int
++ins5902b_set_patch(struct i2c_client *client)
++{
++    u8 val = 0;
++    int rc = 0;
++
++    rc = i2c_smbus_write_byte_data(client, 0x30, 0xd1);
++    rc += i2c_smbus_write_byte_data(client, 0x40, 0x00);
++    rc += i2c_smbus_write_byte_data(client, 0x32, 0x81);
++    /*fixbug 70336, delete mdelay, chenxh, 20250708*/
++    /*mdelay(50);*/
++    rc += i2c_smbus_write_byte_data(client, 0x32, 0x80);
++    /*fixbug 70336, change delay from 50 to 15ms, chenxh, 20250708*/
++    mdelay(15);
++    rc += i2c_smbus_write_byte_data(client, 0x32, 0x4);
++
++    val = i2c_smbus_read_byte_data(client, 0x5c);
++    val = val | 0x8;
++    rc += i2c_smbus_write_byte_data(client, 0x5c, val);
++    /*fixbug 70336, change delay from 50 to 15ms, chenxh, 20250708*/
++    mdelay(15);
++    val = i2c_smbus_read_byte_data(client, 0x5c);
++    val = val & (~0x8);
++    rc += i2c_smbus_write_byte_data(client, 0x5c, val);
++
++    rc += i2c_smbus_write_byte_data(client, 0x30, 0x00);
++
++    return rc;
++}
++
++static int
++ins5902b_probe(struct i2c_client *client, const struct i2c_device_id *id)
++{
++	struct rtc_device *rtc;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return -ENODEV;
++
++	dev_info(&client->dev, "chip found, driver version " DRV_VERSION "\n");
++
++	rtc = rtc_device_register(ins5902b_driver.driver.name,
++				  &client->dev, &ins5902b_rtc_ops, THIS_MODULE);
++	if (IS_ERR(rtc))
++		return PTR_ERR(rtc);
++
++	i2c_set_clientdata(client, rtc);
++    /*set patch when power on*/
++    if (0 > ins5902b_set_patch(client))
++    {
++        dev_err(&client->dev, "%s: set patch failed\n",
++            __func__);
++    }
++
++	return 0;
++}
++
++static struct i2c_device_id ins5902b_id[] = {
++	{ "ins5902b", 0 },
++	{ }
++};
++
++static struct i2c_driver ins5902b_driver = {
++	.driver = {
++		   .name = "rtc-ins5902b",
++		   },
++	.probe = ins5902b_probe,
++	.remove = ins5902b_remove,
++	.id_table = ins5902b_id,
++};
++
++static int __init ins5902b_init(void)
++{
++	return i2c_add_driver(&ins5902b_driver);
++}
++
++static void __exit ins5902b_exit(void)
++{
++	i2c_del_driver(&ins5902b_driver);
++}
++
++MODULE_DESCRIPTION("Maxim INS5902B RTC driver");
++MODULE_AUTHOR("Dale Farnsworth <dale@farnsworth.org>");
++MODULE_LICENSE("GPL");
++MODULE_VERSION(DRV_VERSION);
++
++module_init(ins5902b_init);
++module_exit(ins5902b_exit);
+-- 
+2.25.1
+

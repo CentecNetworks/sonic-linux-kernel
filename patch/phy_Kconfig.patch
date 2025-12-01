@@ -1,0 +1,17 @@
+diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
+index 7d69539ea..525b9f271 100644
+--- a/drivers/net/phy/Kconfig
++++ b/drivers/net/phy/Kconfig
+@@ -308,9 +308,9 @@ config VITESSE_PHY
+ 	  Currently supports the vsc8244
+ 
+ config CTC_PHY
+-    tristate "Centec PHYs"
+-        ---help---
+-        Supports the Centec PHY.
++    	tristate "Centec PHYs"
++        help
++          Supports the Centec PHY.
+ 
+ config XILINX_GMII2RGMII
+ 	tristate "Xilinx GMII2RGMII converter driver"

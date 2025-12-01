@@ -292,6 +292,18 @@ armhf_secondary_boot_online.patch
 0001-Change-the-system.map-file-permission-only-readable-.patch
 
 #
+# phytium-d2000 platform patches for 5.10
+0001-Add-centec-mars-phy.patch
+0002-Add-ins5902b-rtc.patch
+0003-add-stmmac-phytium-v2.1.patch
+0004-add-arch-phytium-kconfig-v2.1.patch
+0005-add-spi-qspi-phytium-v2.1.patch
+0006-add-spi-config-boya.patch
+phy_Kconfig.patch
+fix_mars_compile_err.patch
+fix_rtc_compile_err.patch
+
+#
 #
 ############################################################
 #

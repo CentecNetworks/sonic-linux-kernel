@@ -1,0 +1,2565 @@
+From ddf9911f9107feb6abb258323cc686f58cc55367 Mon Sep 17 00:00:00 2001
+From: qianj <qianj@centec.com>
+Date: Wed, 24 Sep 2025 10:50:27 +0800
+Subject: [PATCH 5/6] add spi qspi phytium v2.1
+
+---
+ drivers/spi/Kconfig            |  38 ++
+ drivers/spi/Makefile           |   5 +
+ drivers/spi/spi-phytium-dma.c  | 555 ++++++++++++++++++++++
+ drivers/spi/spi-phytium-pci.c  | 122 +++++
+ drivers/spi/spi-phytium-plat.c | 204 ++++++++
+ drivers/spi/spi-phytium-qspi.c | 836 +++++++++++++++++++++++++++++++++
+ drivers/spi/spi-phytium.c      | 509 ++++++++++++++++++++
+ drivers/spi/spi-phytium.h      | 213 +++++++++
+ 8 files changed, 2482 insertions(+)
+ create mode 100644 drivers/spi/spi-phytium-dma.c
+ create mode 100644 drivers/spi/spi-phytium-pci.c
+ create mode 100644 drivers/spi/spi-phytium-plat.c
+ create mode 100755 drivers/spi/spi-phytium-qspi.c
+ create mode 100644 drivers/spi/spi-phytium.c
+ create mode 100644 drivers/spi/spi-phytium.h
+
+diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
+index 74ea6b6b5..07b4d4c43 100644
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -585,6 +585,44 @@ config SPI_ORION
+ 	  This enables using the SPI master controller on the Orion
+ 	  and MVEBU chips.
+ 
++config SPI_PHYTIUM
++	tristate
++	depends on ARCH_PHYTIUM || COMPILE_TEST
++
++config SPI_PHYTIUM_PLAT
++	tristate "Phytium SPI controller platform support"
++	select SPI_PHYTIUM
++	help
++	  This selects a platform driver for Phytium SPI controller.
++
++	  If you say yes to this option, support will be included for
++	  Pd1904 and pd2008 families of SPI controller.
++
++config SPI_PHYTIUM_PCI
++	tristate "Phytium SPI controller PCI support"
++	depends on PCI
++	select SPI_PHYTIUM
++	help
++	  This selects a PCI driver for Phytium SPI controller.
++
++	  If you say yes to this option, support will be included for
++	  Phytium px210 chipset of SPI controller.
++
++	  If unsure, say N.
++
++config SPI_PHYTIUM_QSPI
++	tristate "Phytium Quad SPI controller"
++	depends on ARCH_PHYTIUM || COMPILE_TEST
++	depends on OF
++	depends on SPI_MEM
++	help
++	  This enables support for Phytium Quad SPI flash controller.
++
++	  This driver does not support generic SPI. The implementation only
++	  supports spi-mem interface.
++
++	  If unsure, say N.
++
+ config SPI_PIC32
+ 	tristate "Microchip PIC32 series SPI"
+ 	depends on MACH_PIC32 || COMPILE_TEST
+diff --git a/drivers/spi/Makefile b/drivers/spi/Makefile
+index 6fea58216..567bb2073 100644
+--- a/drivers/spi/Makefile
++++ b/drivers/spi/Makefile
+@@ -82,6 +82,11 @@ obj-$(CONFIG_SPI_OMAP_100K)		+= spi-omap-100k.o
+ obj-$(CONFIG_SPI_OMAP24XX)		+= spi-omap2-mcspi.o
+ obj-$(CONFIG_SPI_TI_QSPI)		+= spi-ti-qspi.o
+ obj-$(CONFIG_SPI_ORION)			+= spi-orion.o
++obj-$(CONFIG_SPI_PHYTIUM)		+= spi-phytium.o
++obj-$(CONFIG_SPI_PHYTIUM_PLAT)		+= spi-phytium-plat.o
++obj-$(CONFIG_SPI_PHYTIUM_PCI)		+= spi-phytium-pci.o
++obj-$(CONFIG_SPI_PHYTIUM_QSPI)		+= spi-phytium-qspi.o
++obj-$(CONFIG_SPI_PHYTIUM)       += spi-phytium-dma.o
+ obj-$(CONFIG_SPI_PIC32)			+= spi-pic32.o
+ obj-$(CONFIG_SPI_PIC32_SQI)		+= spi-pic32-sqi.o
+ obj-$(CONFIG_SPI_PL022)			+= spi-pl022.o
+diff --git a/drivers/spi/spi-phytium-dma.c b/drivers/spi/spi-phytium-dma.c
+new file mode 100644
+index 000000000..4f78d0659
+--- /dev/null
++++ b/drivers/spi/spi-phytium-dma.c
+@@ -0,0 +1,555 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Special handling for phytium DMA core
++ *
++ */
++#include <linux/completion.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include <linux/irqreturn.h>
++#include <linux/jiffies.h>
++#include <linux/pci.h>
++#include <linux/spi/spi.h>
++#include <linux/types.h>
++#include <linux/module.h>
++#include "spi-phytium.h"
++
++#define RX_BUSY		0
++#define RX_BURST_LEVEL	16
++#define TX_BUSY		1
++#define TX_BURST_LEVEL	16
++
++#define DMA_MAX_BUF_SIZE	4096
++
++static void phytium_spi_dma_maxburst_init(struct phytium_spi *fts)
++{
++	struct dma_slave_caps caps;
++	u32 max_burst, def_burst;
++	int ret;
++
++	def_burst = fts->fifo_len / 2;
++
++	ret = dma_get_slave_caps(fts->rxchan, &caps);
++	if (!ret && caps.max_burst)
++		max_burst = caps.max_burst;
++	else
++		max_burst = RX_BURST_LEVEL;
++
++	fts->rxburst = min(max_burst, def_burst);
++	phytium_writel(fts, DMARDLR, 0x0);
++
++	ret = dma_get_slave_caps(fts->txchan, &caps);
++	if (!ret && caps.max_burst)
++		max_burst = caps.max_burst;
++	else
++		max_burst = TX_BURST_LEVEL;
++
++	/*
++	 * Having a Rx DMA channel serviced with higher priority than a Tx DMA
++	 * channel might not be enough to provide a well balanced DMA-based
++	 * SPI transfer interface. There might still be moments when the Tx DMA
++	 * channel is occasionally handled faster than the Rx DMA channel.
++	 * That in its turn will eventually cause the SPI Rx FIFO overflow if
++	 * SPI bus speed is high enough to fill the SPI Rx FIFO in before it's
++	 * cleared by the Rx DMA channel. In order to fix the problem the Tx
++	 * DMA activity is intentionally slowed down by limiting the SPI Tx
++	 * FIFO depth with a value twice bigger than the Tx burst length.
++	 */
++	fts->txburst = min(max_burst, def_burst);
++	/* set dmatdlr to 0 + 1 */
++	phytium_writel(fts, DMATDLR, 0);
++}
++
++static void phytium_spi_dma_sg_burst_init(struct phytium_spi *fts)
++{
++	struct dma_slave_caps tx = {0}, rx = {0};
++
++	dma_get_slave_caps(fts->txchan, &tx);
++	dma_get_slave_caps(fts->rxchan, &rx);
++
++	if (tx.max_sg_burst > 0 && rx.max_sg_burst > 0)
++		fts->dma_sg_burst = min(tx.max_sg_burst, rx.max_sg_burst);
++	else if (tx.max_sg_burst > 0)
++		fts->dma_sg_burst = tx.max_sg_burst;
++	else if (rx.max_sg_burst > 0)
++		fts->dma_sg_burst = rx.max_sg_burst;
++	else
++		fts->dma_sg_burst = 0;
++}
++
++static int phytium_spi_dma_init(struct device *dev, struct phytium_spi *fts)
++{
++	fts->rxchan = dma_request_chan(dev, "rx");
++	if (IS_ERR_OR_NULL(fts->rxchan))
++		return -ENODEV;
++
++	fts->txchan = dma_request_chan(dev, "tx");
++	if (IS_ERR_OR_NULL(fts->txchan)) {
++		dev_err(dev, "can't request chan\n");
++		dma_release_channel(fts->rxchan);
++		fts->rxchan = NULL;
++		return -ENODEV;
++	}
++
++	fts->master->dma_rx = fts->rxchan;
++	fts->master->dma_tx = fts->txchan;
++	init_completion(&fts->dma_completion);
++
++	phytium_spi_dma_maxburst_init(fts);
++	phytium_spi_dma_sg_burst_init(fts);
++
++	return 0;
++}
++
++static void phytium_spi_dma_exit(struct phytium_spi *fts)
++{
++	if (fts->txchan) {
++		dmaengine_terminate_sync(fts->txchan);
++		dma_release_channel(fts->txchan);
++	}
++
++	if (fts->rxchan) {
++		dmaengine_terminate_sync(fts->rxchan);
++		dma_release_channel(fts->rxchan);
++	}
++}
++
++static irqreturn_t phytium_spi_dma_transfer_handler(struct phytium_spi *fts)
++{
++	phytium_spi_check_status(fts, false);
++
++	complete(&fts->dma_completion);
++
++	return IRQ_HANDLED;
++}
++
++static bool phytium_spi_can_dma(struct spi_controller *master,
++			   struct spi_device *spi, struct spi_transfer *xfer)
++{
++	struct phytium_spi *fts = spi_controller_get_devdata(master);
++
++	return xfer->len > fts->fifo_len;
++}
++
++static enum dma_slave_buswidth phytium_spi_dma_convert_width(u8 n_bytes)
++{
++	if (n_bytes == 1)
++		return DMA_SLAVE_BUSWIDTH_1_BYTE;
++	else if (n_bytes == 2)
++		return DMA_SLAVE_BUSWIDTH_2_BYTES;
++
++	return DMA_SLAVE_BUSWIDTH_UNDEFINED;
++}
++
++static int phytium_spi_dma_wait(struct phytium_spi *fts, unsigned int len,
++					u32 speed)
++{
++	unsigned long long ms;
++
++	ms = len * MSEC_PER_SEC * BITS_PER_BYTE;
++	do_div(ms, speed);
++	ms += ms + 200;
++
++	if (ms > UINT_MAX)
++		ms = UINT_MAX;
++
++	ms = wait_for_completion_timeout(&fts->dma_completion,
++					 msecs_to_jiffies(ms));
++
++	if (ms == 0) {
++		dev_err(&fts->master->cur_msg->spi->dev,
++			"DMA transaction timed out\n");
++		return -ETIMEDOUT;
++	}
++
++	return 0;
++}
++
++static inline bool phytium_spi_dma_tx_busy(struct phytium_spi *fts)
++{
++	return !(phytium_readl(fts, SR) & SR_TF_EMPT);
++}
++
++static int phytium_spi_dma_wait_tx_done(struct phytium_spi *fts,
++				   struct spi_transfer *xfer)
++{
++	int retry = SPI_WAIT_RETRIES;
++	struct spi_delay delay;
++	u32 nents;
++
++	nents = phytium_readl(fts, TXFLR);
++	delay.unit = SPI_DELAY_UNIT_SCK;
++	delay.value = nents * fts->n_bytes * BITS_PER_BYTE;
++
++	while (phytium_spi_dma_tx_busy(fts) && retry--)
++		spi_delay_exec(&delay, xfer);
++
++	if (retry < 0) {
++		dev_err(&fts->master->dev, "Tx hanged up\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/*
++ * fts->dma_chan_busy is set before the dma transfer starts, callback for tx
++ * channel will clear a corresponding bit.
++ */
++static void phytium_spi_dma_tx_done(void *arg)
++{
++	struct phytium_spi *fts = arg;
++
++	clear_bit(TX_BUSY, &fts->dma_chan_busy);
++	if (test_bit(RX_BUSY, &fts->dma_chan_busy))
++		return;
++
++	complete(&fts->dma_completion);
++}
++
++static int phytium_spi_dma_config_tx(struct phytium_spi *fts)
++{
++	struct dma_slave_config txconf;
++
++	memset(&txconf, 0, sizeof(txconf));
++	txconf.direction = DMA_MEM_TO_DEV;
++	txconf.dst_addr = fts->dma_addr;
++	txconf.dst_maxburst = fts->txburst;
++	txconf.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
++	txconf.dst_addr_width = phytium_spi_dma_convert_width(fts->n_bytes);
++	txconf.device_fc = false;
++
++	return dmaengine_slave_config(fts->txchan, &txconf);
++}
++
++static int phytium_spi_dma_submit_tx(struct phytium_spi *fts, struct scatterlist *sgl,
++				unsigned int nents)
++{
++	struct dma_async_tx_descriptor *txdesc;
++	dma_cookie_t cookie;
++	int ret;
++
++	txdesc = dmaengine_prep_slave_sg(fts->txchan, sgl, nents,
++					 DMA_MEM_TO_DEV,
++					 DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
++	if (!txdesc)
++		return -ENOMEM;
++
++	txdesc->callback = phytium_spi_dma_tx_done;
++	txdesc->callback_param = fts;
++
++	cookie = dmaengine_submit(txdesc);
++	ret = dma_submit_error(cookie);
++	if (ret) {
++		dmaengine_terminate_sync(fts->txchan);
++		return ret;
++	}
++
++	set_bit(TX_BUSY, &fts->dma_chan_busy);
++
++	return 0;
++}
++
++static inline bool phytium_spi_dma_rx_busy(struct phytium_spi *fts)
++{
++	return !!(phytium_readl(fts, SR) & SR_RF_NOT_EMPT);
++}
++
++static int phytium_spi_dma_wait_rx_done(struct phytium_spi *fts)
++{
++	int retry = SPI_WAIT_RETRIES;
++	struct spi_delay delay;
++	unsigned long ns, us;
++	u32 nents;
++
++	/*
++	 * It's unlikely that DMA engine is still doing the data fetching, but
++	 * if it's let's give it some reasonable time. The timeout calculation
++	 * is based on the synchronous APB/SSI reference clock rate, on a
++	 * number of data entries left in the Rx FIFO, times a number of clock
++	 * periods normally needed for a single APB read/write transaction
++	 * without PREADY signal utilized (which is true for the phytium APB SSI
++	 * controller).
++	 */
++	nents = phytium_readl(fts, RXFLR);
++	ns = 4U * NSEC_PER_SEC / fts->max_freq * nents;
++	if (ns <= NSEC_PER_USEC) {
++		delay.unit = SPI_DELAY_UNIT_NSECS;
++		delay.value = ns;
++	} else {
++		us = DIV_ROUND_UP(ns, NSEC_PER_USEC);
++		delay.unit = SPI_DELAY_UNIT_USECS;
++		delay.value = clamp_val(us, 0, USHRT_MAX);
++	}
++
++	while (phytium_spi_dma_rx_busy(fts) && retry--)
++		spi_delay_exec(&delay, NULL);
++
++	if (retry < 0) {
++		dev_err(&fts->master->dev, "Rx hanged up, nents = %d\n", nents);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/*
++ * fts->dma_chan_busy is set before the dma transfer starts, callback for rx
++ * channel will clear a corresponding bit.
++ */
++static void phytium_spi_dma_rx_done(void *arg)
++{
++	struct phytium_spi *fts = arg;
++
++	clear_bit(RX_BUSY, &fts->dma_chan_busy);
++	if (test_bit(TX_BUSY, &fts->dma_chan_busy))
++		return;
++
++	complete(&fts->dma_completion);
++}
++
++static int phytium_spi_dma_config_rx(struct phytium_spi *fts)
++{
++	struct dma_slave_config rxconf;
++
++	memset(&rxconf, 0, sizeof(rxconf));
++	rxconf.direction = DMA_DEV_TO_MEM;
++	rxconf.src_addr = fts->dma_addr;
++	rxconf.src_maxburst = fts->rxburst;
++	rxconf.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
++	rxconf.src_addr_width = phytium_spi_dma_convert_width(fts->n_bytes);
++	rxconf.device_fc = false;
++
++	return dmaengine_slave_config(fts->rxchan, &rxconf);
++}
++
++static int phytium_spi_dma_submit_rx(struct phytium_spi *fts, struct scatterlist *sgl,
++				unsigned int nents)
++{
++	struct dma_async_tx_descriptor *rxdesc;
++	dma_cookie_t cookie;
++	int ret;
++
++	rxdesc = dmaengine_prep_slave_sg(fts->rxchan, sgl, nents,
++					 DMA_DEV_TO_MEM,
++					 DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
++	if (!rxdesc)
++		return -ENOMEM;
++
++	rxdesc->callback = phytium_spi_dma_rx_done;
++	rxdesc->callback_param = fts;
++
++	cookie = dmaengine_submit(rxdesc);
++	ret = dma_submit_error(cookie);
++	if (ret) {
++		dmaengine_terminate_sync(fts->rxchan);
++		return ret;
++	}
++
++	set_bit(RX_BUSY, &fts->dma_chan_busy);
++
++	return 0;
++}
++
++static int phytium_spi_dma_setup(struct phytium_spi *fts, struct spi_transfer *xfer)
++{
++	u16 imr, dma_ctrl;
++	int ret;
++
++	if (!xfer->tx_buf)
++		return -EINVAL;
++
++	/* Setup DMA channels */
++	ret = phytium_spi_dma_config_tx(fts);
++	if (ret)
++		return ret;
++
++	if (xfer->rx_buf) {
++		ret = phytium_spi_dma_config_rx(fts);
++		if (ret)
++			return ret;
++	}
++
++	/* Set the DMA handshaking interface */
++	dma_ctrl = SPI_DMA_TDMAE;
++	if (xfer->rx_buf)
++		dma_ctrl |= SPI_DMA_RDMAE;
++	phytium_writel(fts, DMACR, dma_ctrl);
++
++	/* Set the interrupt mask */
++	imr = INT_TXOI;
++	if (xfer->rx_buf)
++		imr |= INT_RXUI | INT_RXOI;
++
++	spi_umask_intr(fts, imr);
++
++	reinit_completion(&fts->dma_completion);
++
++	fts->transfer_handler = phytium_spi_dma_transfer_handler;
++
++	return 0;
++}
++
++static int phytium_spi_dma_transfer_all(struct phytium_spi *fts,
++				   struct spi_transfer *xfer)
++{
++	int ret;
++
++	/* Submit the DMA Tx transfer */
++	ret = phytium_spi_dma_submit_tx(fts, xfer->tx_sg.sgl, xfer->tx_sg.nents);
++	if (ret)
++		goto err_clear_dmac;
++
++	/* Submit the DMA Rx transfer if required */
++	if (xfer->rx_buf) {
++		ret = phytium_spi_dma_submit_rx(fts, xfer->rx_sg.sgl,
++					   xfer->rx_sg.nents);
++		if (ret)
++			goto err_clear_dmac;
++
++		/* rx must be started before tx due to spi instinct */
++		dma_async_issue_pending(fts->rxchan);
++	}
++
++	dma_async_issue_pending(fts->txchan);
++
++	ret = phytium_spi_dma_wait(fts, xfer->len, xfer->effective_speed_hz);
++
++err_clear_dmac:
++	phytium_writel(fts, DMACR, 0);
++
++	return ret;
++}
++
++static int phytium_spi_dma_transfer_one(struct phytium_spi *fts,
++				   struct spi_transfer *xfer)
++{
++	struct scatterlist *tx_sg = NULL, *rx_sg = NULL, tx_tmp, rx_tmp;
++	unsigned int tx_len = 0, rx_len = 0;
++	unsigned int base, len;
++	int ret;
++
++	sg_init_table(&tx_tmp, 1);
++	sg_init_table(&rx_tmp, 1);
++
++	for (base = 0, len = 0; base < xfer->len; base += len) {
++		/* Fetch next Tx DMA data chunk */
++		if (!tx_len) {
++			tx_sg = !tx_sg ? &xfer->tx_sg.sgl[0] : sg_next(tx_sg);
++			sg_dma_address(&tx_tmp) = sg_dma_address(tx_sg);
++			tx_len = sg_dma_len(tx_sg);
++		}
++
++		/* Fetch next Rx DMA data chunk */
++		if (!rx_len) {
++			rx_sg = !rx_sg ? &xfer->rx_sg.sgl[0] : sg_next(rx_sg);
++			sg_dma_address(&rx_tmp) = sg_dma_address(rx_sg);
++			rx_len = sg_dma_len(rx_sg);
++		}
++
++		if ((base + DMA_MAX_BUF_SIZE) > xfer->len)
++			len = xfer->len - base;
++		else
++			len = DMA_MAX_BUF_SIZE;
++
++		len = min3(len, tx_len, rx_len);
++
++		sg_dma_len(&tx_tmp) = len;
++		sg_dma_len(&rx_tmp) = len;
++
++		/* Submit DMA Tx transfer */
++		ret = phytium_spi_dma_submit_tx(fts, &tx_tmp, 1);
++		if (ret)
++			break;
++
++		/* Submit DMA Rx transfer */
++		ret = phytium_spi_dma_submit_rx(fts, &rx_tmp, 1);
++		if (ret)
++			break;
++
++		/* Rx must be started before Tx due to SPI instinct */
++		dma_async_issue_pending(fts->rxchan);
++
++		dma_async_issue_pending(fts->txchan);
++
++		/*
++		 * Here we only need to wait for the DMA transfer to be
++		 * finished since SPI controller is kept enabled during the
++		 * procedure this loop implements and there is no risk to lose
++		 * data left in the Tx/Rx FIFOs.
++		 */
++		ret = phytium_spi_dma_wait(fts, len, xfer->effective_speed_hz);
++		if (ret)
++			break;
++
++		reinit_completion(&fts->dma_completion);
++
++		sg_dma_address(&tx_tmp) += len;
++		sg_dma_address(&rx_tmp) += len;
++		tx_len -= len;
++		rx_len -= len;
++	}
++
++	phytium_writel(fts, DMACR, 0);
++
++	return ret;
++}
++
++static int phytium_spi_dma_transfer(struct phytium_spi *fts, struct spi_transfer *xfer)
++{
++	unsigned int nents;
++	int ret;
++
++	nents = max(xfer->tx_sg.nents, xfer->rx_sg.nents);
++
++	/*
++	 * large transfer length caused spi RX FIFO full event
++	 * transfer 4096 bytes each time
++	 */
++	if (xfer->len <= DMA_MAX_BUF_SIZE)
++		ret = phytium_spi_dma_transfer_all(fts, xfer);
++	else
++		ret = phytium_spi_dma_transfer_one(fts, xfer);
++	if (ret)
++		return ret;
++
++	if (fts->master->cur_msg->status == -EINPROGRESS) {
++		ret = phytium_spi_dma_wait_tx_done(fts, xfer);
++		if (ret)
++			return ret;
++	}
++
++	if (xfer->rx_buf && fts->master->cur_msg->status == -EINPROGRESS)
++		ret = phytium_spi_dma_wait_rx_done(fts);
++
++	return ret;
++}
++
++static void phytium_spi_dma_stop(struct phytium_spi *fts)
++{
++	if (test_bit(TX_BUSY, &fts->dma_chan_busy)) {
++		dmaengine_terminate_sync(fts->txchan);
++		clear_bit(TX_BUSY, &fts->dma_chan_busy);
++	}
++	if (test_bit(RX_BUSY, &fts->dma_chan_busy)) {
++		dmaengine_terminate_sync(fts->rxchan);
++		clear_bit(RX_BUSY, &fts->dma_chan_busy);
++	}
++}
++
++static const struct phytium_spi_dma_ops phytium_spi_dma_generic_ops = {
++	.dma_init	= phytium_spi_dma_init,
++	.dma_exit	= phytium_spi_dma_exit,
++	.dma_setup	= phytium_spi_dma_setup,
++	.can_dma	= phytium_spi_can_dma,
++	.dma_transfer	= phytium_spi_dma_transfer,
++	.dma_stop	= phytium_spi_dma_stop,
++};
++
++void phytium_spi_dmaops_set(struct phytium_spi *fts)
++{
++	fts->dma_ops = &phytium_spi_dma_generic_ops;
++}
++EXPORT_SYMBOL_GPL(phytium_spi_dmaops_set);
++
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/spi/spi-phytium-pci.c b/drivers/spi/spi-phytium-pci.c
+new file mode 100644
+index 000000000..5bc686342
+--- /dev/null
++++ b/drivers/spi/spi-phytium-pci.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Phytium SPI core controller PCI driver.
++ *
++ * Copyright (c) 2019-2024 Phytium Technology Co., Ltd.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/gpio.h>
++#include <linux/highmem.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/scatterlist.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/property.h>
++
++#include "spi-phytium.h"
++
++#define DRIVER_NAME "phytium_spi_pci"
++
++static int phytium_spi_pci_probe(struct pci_dev *pdev,
++			    const struct pci_device_id *id)
++{
++	struct phytium_spi *fts;
++	int pci_bar = 0;
++	int ret;
++
++	fts = devm_kzalloc(&pdev->dev, sizeof(struct phytium_spi),
++			GFP_KERNEL);
++	if (!fts)
++		return -ENOMEM;
++
++	ret = pcim_enable_device(pdev);
++	if (ret)
++		return ret;
++
++	ret = pcim_iomap_regions(pdev, 1 << pci_bar, pci_name(pdev));
++	if (ret) {
++		dev_err(&pdev->dev, "pci iomap failed?\n");
++		return ret;
++	}
++
++	fts->regs = pcim_iomap_table(pdev)[pci_bar];
++	if (IS_ERR(fts->regs)) {
++		dev_err(&pdev->dev, "SPI region map failed\n");
++		return PTR_ERR(fts->regs);
++	}
++
++	fts->irq = pdev->irq;
++	if (fts->irq < 0) {
++		dev_err(&pdev->dev, "no irq resource?\n");
++		return fts->irq; /* -ENXIO */
++	}
++
++	fts->bus_num = -1;
++
++	fts->max_freq = 48000000;
++
++	fts->num_cs = 4;
++
++	fts->global_cs = 1;
++
++	ret = phytium_spi_add_host(&pdev->dev, fts);
++	if (ret)
++		return ret;
++
++	pci_set_drvdata(pdev, fts);
++	return 0;
++}
++
++static void phytium_spi_pci_remove(struct pci_dev *pdev)
++{
++	struct phytium_spi *fts = pci_get_drvdata(pdev);
++
++	phytium_spi_remove_host(fts);
++}
++
++
++#ifdef CONFIG_PM_SLEEP
++static int spi_suspend(struct device *dev)
++{
++	struct phytium_spi *fts = dev_get_drvdata(dev);
++
++	return phytium_spi_suspend_host(fts);
++}
++
++static int spi_resume(struct device *dev)
++{
++	struct phytium_spi *fts = dev_get_drvdata(dev);
++
++	return phytium_spi_resume_host(fts);
++}
++#endif
++
++static SIMPLE_DEV_PM_OPS(phytium_spi_pm_ops, spi_suspend, spi_resume);
++
++static const struct pci_device_id phytium_device_pci_tbl[] = {
++	{ PCI_VDEVICE(PHYTIUM, 0xdc2c) },
++	{},
++};
++
++static struct pci_driver phytium_spi_pci_driver = {
++	.name		= DRIVER_NAME,
++	.id_table	= phytium_device_pci_tbl,
++	.probe		= phytium_spi_pci_probe,
++	.remove		= phytium_spi_pci_remove,
++	.driver		= {
++		.pm = &phytium_spi_pm_ops,
++	}
++};
++
++module_pci_driver(phytium_spi_pci_driver);
++
++MODULE_AUTHOR("Yiqun Zhang <zhangyiqun@phytium.com.cn>");
++MODULE_DESCRIPTION("PCI Driver for Phytium SPI controller core");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/spi/spi-phytium-plat.c b/drivers/spi/spi-phytium-plat.c
+new file mode 100644
+index 000000000..57593cd0e
+--- /dev/null
++++ b/drivers/spi/spi-phytium-plat.c
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Phytium SPI core controller platform driver.
++ *
++ * Copyright (c) 2019-2024 Phytium Technology Co., Ltd.
++ */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/gpio.h>
++#include <linux/highmem.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/scatterlist.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/of_platform.h>
++#include <linux/property.h>
++#include <linux/acpi.h>
++
++#include "spi-phytium.h"
++
++#define DRIVER_NAME "phytium_spi"
++
++static int phytium_spi_probe(struct platform_device *pdev)
++{
++	struct phytium_spi *fts;
++	struct resource *mem;
++	int ret;
++	int num_cs;
++	int cs_gpio;
++	int global_cs;
++	int i;
++
++	fts = devm_kzalloc(&pdev->dev, sizeof(struct phytium_spi),
++			GFP_KERNEL);
++	if (!fts)
++		return -ENOMEM;
++
++	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!mem) {
++		dev_err(&pdev->dev, "no mem resource?\n");
++		return -EINVAL;
++	}
++
++	fts->paddr = mem->start;
++	fts->regs = devm_ioremap_resource(&pdev->dev, mem);
++	if (IS_ERR(fts->regs)) {
++		dev_err(&pdev->dev, "SPI region map failed\n");
++		return PTR_ERR(fts->regs);
++	}
++
++	fts->irq = platform_get_irq(pdev, 0);
++	if (fts->irq < 0) {
++		dev_err(&pdev->dev, "no irq resource?\n");
++		return fts->irq; /* -ENXIO */
++	}
++
++	if (pdev->dev.of_node) {
++		fts->clk = devm_clk_get(&pdev->dev, NULL);
++
++		if (IS_ERR(fts->clk))
++			return PTR_ERR(fts->clk);
++		ret = clk_prepare_enable(fts->clk);
++		if (ret)
++			return ret;
++
++		fts->max_freq = clk_get_rate(fts->clk);
++	} else if (has_acpi_companion(&pdev->dev)) {
++		fts->max_freq = 48000000;
++	}
++
++	fts->bus_num = pdev->id;
++	device_property_read_u32(&pdev->dev, "reg-io-width", &fts->reg_io_width);
++
++	num_cs = 4;
++	device_property_read_u32(&pdev->dev, "num-cs", &num_cs);
++	fts->num_cs = num_cs;
++
++	if (pdev->dev.of_node) {
++		int i;
++
++		for (i = 0; i < fts->num_cs; i++) {
++			cs_gpio = of_get_named_gpio(pdev->dev.of_node,
++					"cs-gpios", i);
++
++			if (cs_gpio == -EPROBE_DEFER) {
++				ret = cs_gpio;
++				goto out;
++			}
++
++			if (gpio_is_valid(cs_gpio)) {
++				ret = devm_gpio_request(&pdev->dev, cs_gpio,
++						dev_name(&pdev->dev));
++				if (ret)
++					goto out;
++			}
++		}
++	} else if(has_acpi_companion(&pdev->dev)) {
++		int n;
++		int *cs;
++		struct gpio_desc *gpiod;
++
++		n = gpiod_count(&pdev->dev, "cs");
++
++		cs = devm_kcalloc(&pdev->dev, n, sizeof(int), GFP_KERNEL);
++		fts->cs = cs;
++
++		for (i = 0; i < n; i++) {
++			gpiod = devm_gpiod_get_index_optional(&pdev->dev, "cs", i,
++							      GPIOD_OUT_LOW);
++
++			if (IS_ERR(gpiod)) {
++				ret = PTR_ERR(gpiod);
++				goto out;
++			}
++
++			cs_gpio = desc_to_gpio(gpiod);
++			cs[i] = cs_gpio;
++		}
++	}
++
++	device_property_read_u32(&pdev->dev, "global-cs", &global_cs);
++	fts->global_cs = global_cs;
++
++	/* check is use dma transfer */
++	if ((device_property_read_string_array(&pdev->dev, "dma-names",
++					NULL, 0) > 0) &&
++		device_property_present(&pdev->dev, "dmas")) {
++		fts->dma_en = true;
++		phytium_spi_dmaops_set(fts);
++	}
++
++	ret = phytium_spi_add_host(&pdev->dev, fts);
++	if (ret)
++		goto out;
++
++	platform_set_drvdata(pdev, fts);
++	return 0;
++
++out:
++	clk_disable_unprepare(fts->clk);
++	return ret;
++}
++
++static int phytium_spi_remove(struct platform_device *pdev)
++{
++	struct phytium_spi *fts = platform_get_drvdata(pdev);
++
++	phytium_spi_remove_host(fts);
++	clk_disable_unprepare(fts->clk);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int spi_suspend(struct device *dev)
++{
++	struct phytium_spi *fts = dev_get_drvdata(dev);
++
++	return phytium_spi_suspend_host(fts);
++}
++
++static int spi_resume(struct device *dev)
++{
++	struct phytium_spi *fts = dev_get_drvdata(dev);
++
++	return phytium_spi_resume_host(fts);
++}
++#endif
++
++static SIMPLE_DEV_PM_OPS(phytium_spi_pm_ops, spi_suspend, spi_resume);
++
++static const struct of_device_id phytium_spi_of_match[] = {
++	{ .compatible = "phytium,spi", .data = (void *)0 },
++	{ /* end of table */}
++};
++MODULE_DEVICE_TABLE(of, phytium_spi_of_match);
++
++static const struct acpi_device_id phytium_spi_acpi_match[] = {
++	{"PHYT000E", 0},
++	{}
++};
++MODULE_DEVICE_TABLE(acpi, phytium_spi_acpi_match);
++
++static struct platform_driver phytium_spi_driver = {
++	.probe		= phytium_spi_probe,
++	.remove		= phytium_spi_remove,
++	.driver		= {
++		.name	= DRIVER_NAME,
++		.of_match_table = of_match_ptr(phytium_spi_of_match),
++		.acpi_match_table = ACPI_PTR(phytium_spi_acpi_match),
++		.pm = &phytium_spi_pm_ops,
++	},
++};
++module_platform_driver(phytium_spi_driver);
++
++MODULE_AUTHOR("Yiqun Zhang <zhangyiqun@phytium.com.cn>");
++MODULE_DESCRIPTION("Platform Driver for Phytium SPI controller core");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/spi/spi-phytium-qspi.c b/drivers/spi/spi-phytium-qspi.c
+new file mode 100755
+index 000000000..8695b627c
+--- /dev/null
++++ b/drivers/spi/spi-phytium-qspi.c
+@@ -0,0 +1,836 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Phytium Quad SPI controller driver.
++ *
++ * Copyright (c) 2022-2024 Phytium Technology Co., Ltd.
++ */
++
++#include <linux/clk.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++
++#include <linux/spi/spi-mem.h>
++#include <linux/mtd/spi-nor.h>
++
++
++#define QSPI_FLASH_CAP_REG		0x00
++#define  QSPI_FLASH_CAP_NUM_SHIFT	3
++#define  QSPI_FLASH_CAP_NUM_MASK	(0x3 << QSPI_FLASH_CAP_NUM_SHIFT)
++#define  QSPI_FLASH_CAP_CAP_SHIFT	0
++#define  QSPI_FLASH_CAP_CAP_MASK	(0x7 << QSPI_FLASH_CAP_CAP_SHIFT)
++
++#define QSPI_RD_CFG_REG			0x04
++#define  QSPI_RD_CFG_RD_CMD_SHIFT	24
++#define  QSPI_RD_CFG_RD_CMD_MASK	(0xff << QSPI_RD_CFG_RD_CMD_SHIFT)
++#define  QSPI_RD_CFG_RD_THROUGH_SHIFT	23
++#define  QSPI_RD_CFG_RD_THROUGH_MASK	(0x1 << QSPI_RD_CFG_RD_THROUGH_SHIFT)
++#define  QSPI_RD_CFG_RD_TRANSFER_SHIFT	20
++#define  QSPI_RD_CFG_RD_TRANSFER_MASK	(0x7 << QSPI_RD_CFG_RD_TRANSFER_SHIFT)
++#define  QSPI_RD_CFG_RD_ADDR_SEL_SHIFT	19
++#define  QSPI_RD_CFG_RD_ADDR_SEL_MASK	(0x1 << QSPI_RD_CFG_RD_ADDR_SEL_SHIFT)
++#define  QSPI_RD_CFG_RD_LATENCY_SHIFT	18
++#define  QSPI_RD_CFG_RD_LATENCY_MASK	(0x1 << QSPI_RD_CFG_RD_LATENCY_SHIFT)
++#define  QSPI_RD_CFG_MODE_BYTE_SHIFT	17
++#define  QSPI_RD_CFG_MODE_BYTE_MASK	(0x1 << QSPI_RD_CFG_MODE_BYTE_SHIFT)
++#define  QSPI_RD_CFG_CMD_SIGN_SHIFT	9
++#define  QSPI_RD_CFG_CMD_SIGN_MASK	(0xff << QSPI_RD_CFG_CMD_SIGN_SHIFT)
++#define  QSPI_RD_CFG_DUMMY_SHIFT	4
++#define  QSPI_RD_CFG_DUMMY_MASK		(0x1f << QSPI_RD_CFG_DUMMY_SHIFT)
++#define  QSPI_RD_CFG_D_BUFFER_SHIFT	3
++#define  QSPI_RD_CFG_D_BUFFER_MASK	(0x1 << QSPI_RD_CFG_D_BUFFER_SHIFT)
++#define  QSPI_RD_CFG_RD_SCK_SEL_SHIFT	0
++#define  QSPI_RD_CFG_RD_SCK_SEL_MASK	(0x7 << QSPI_RD_CFG_RD_SCK_SEL_SHIFT)
++
++#define QSPI_WR_CFG_REG			0x08
++#define  QSPI_WR_CFG_WR_CMD_SHIFT	24
++#define  QSPI_WR_CFG_WR_CMD_MASK	(0xff << QSPI_WR_CFG_WR_CMD_SHIFT)
++#define  QSPI_WR_CFG_WR_WAIT_SHIFT	9
++#define  QSPI_WR_CFG_WR_WAIT_MASK	(0x01 << QSPI_WR_CFG_WR_WAIT_SHIFT)
++#define  QSPI_WR_CFG_WR_THROUGH_SHIFT	8
++#define  QSPI_WR_CFG_WR_THROUGH_MASK	(0x01 << QSPI_WR_CFG_WR_THROUGH_SHIFT)
++#define  QSPI_WR_CFG_WR_TRANSFER_SHIFT	5
++#define  QSPI_WR_CFG_WR_TRANSFER_MASK	(0X7 << QSPI_WR_CFG_WR_TRANSFER_SHIFT)
++#define  QSPI_WR_CFG_WR_ADDR_SEL_SHIFT	4
++#define  QSPI_WR_CFG_WR_ADDR_SEL_MASK	(0x1 << QSPI_WR_CFG_WR_ADDR_SEL_SHIFT)
++#define  QSPI_WR_CFG_WR_MODE_SHIFT	3
++#define  QSPI_WR_CFG_WR_MODE_MASK	(0x1 << QSPI_WR_CFG_WR_MODE_SHIFT)
++#define  QSPI_WR_CFG_WR_SCK_SEL_SHIFT	0
++#define  QSPI_WR_CFG_WR_SCK_SEL_MASK	(0x7 << QSPI_WR_CFG_WR_SCK_SEL_SHIFT)
++
++#define QSPI_FLUSH_REG			0x0c
++#define  QSPI_FLUSH_EN			(0x1 << 0)
++
++#define QSPI_CMD_PORT_REG		0x10
++#define  QSPI_CMD_PORT_CMD_SHIFT	24
++#define  QSPI_CMD_PORT_CMD_MASK		(0xff << QSPI_CMD_PORT_CMD_SHIFT)
++#define  QSPI_CMD_PORT_WAIT_SHIFT	22
++#define  QSPI_CMD_PORT_WAIT_MASK	(0x1 << QSPI_CMD_PORT_WAIT_SHIFT)
++#define  QSPI_CMD_PORT_THROUGH_SHIFT	21
++#define  QSPI_CMD_PORT_THROUGH_MASK	(0x1 << QSPI_CMD_PORT_THROUGH_SHIFT)
++#define  QSPI_CMD_PORT_CS_SHIFT		19
++#define  QSPI_CMD_PORT_CS_MASK		(0x3 << QSPI_CMD_PORT_CS_SHIFT)
++#define  QSPI_CMD_PORT_TRANSFER_SHIFT	16
++#define  QSPI_CMD_PORT_TRANSFER_MASK	(0x7 << QSPI_CMD_PORT_TRANSFER_SHIFT)
++#define  QSPI_CMD_PORT_CMD_ADDR_SHIFT	15
++#define  QSPI_CMD_PORT_CMD_ADDR_MASK	(0x1 << QSPI_CMD_PORT_CMD_ADDR_SHIFT)
++#define  QSPI_CMD_PORT_LATENCY_SHIFT	14
++#define  QSPI_CMD_PORT_LATENCY_MASK	(0x1 << QSPI_CMD_PORT_LATENCY_SHIFT)
++#define  QSPI_CMD_PORT_DATA_XFER_SHIFT	13
++#define  QSPI_CMD_PORT_DATA_XFER_MASK	(0x1 << QSPI_CMD_PORT_DATA_XFER_SHIFT)
++#define  QSPI_CMD_PORT_ADDR_SEL_SHIFT	12
++#define  QSPI_CMD_PORT_ADDR_SEL_MASK	(0x1 << QSPI_CMD_PORT_ADDR_SEL_SHIFT)
++#define  QSPI_CMD_PORT_DUMMY_SHIFT	7
++#define  QSPI_CMD_PORT_DUMMY_MASK	(0x1f << QSPI_CMD_PORT_DUMMY_SHIFT)
++#define  QSPI_CMD_PORT_P_BUFFER_SHIFT	6
++#define  QSPI_CMD_PORT_P_BUFFER_MASK	(0x1 << QSPI_CMD_PORT_P_BUFFER_SHIFT)
++#define  QSPI_CMD_PORT_RW_NUM_SHIFT	3
++#define  QSPI_CMD_PORT_RW_NUM_MASK	(0x7 << QSPI_CMD_PORT_RW_NUM_SHIFT)
++#define  QSPI_CMD_PORT_SCK_SEL_SHIFT	0
++#define  QSPI_CMD_PORT_SCK_SEL_MASK	(0x7 << QSPI_CMD_PORT_SCK_SEL_SHIFT)
++
++#define QSPI_ADDR_PORT_REG		0x14
++#define QSPI_HD_PORT_REG		0x18
++#define QSPI_LD_PORT_REG		0x1c
++
++#define QSPI_FUN_SET_REG		0x20
++#define  QSPI_FUN_SET_HOLD_SHIFT	24
++#define  QSPI_FUN_SET_HOLD_MASK		(0xff << QSPI_FUN_SET_HOLD_SHIFT)
++#define  QSPI_FUN_SET_SETUP_SHIFT	16
++#define  QSPI_FUN_SET_SETUP_MASK	(0xff << QSPI_FUN_SET_SETUP_SHIFT)
++#define  QSPI_FUN_SET_DELAY_SHIFT	0
++#define  QSPI_FUN_SET_DELAY_MASK	(0xffff << QSPI_FUN_SET_DELAY_SHIFT)
++
++#define QSPI_WIP_REG			0x24
++#define  QSPI_WIP_W_CMD_SHIFT		24
++#define  QSPI_WIP_W_CMD_MASK		(0xff << QSPI_WIP_W_CMD_SHIFT)
++#define  QSPI_WIP_W_TRANSFER_SHIFT	3
++#define  QSPI_WIP_W_TRANSFER_MASK	(0x3 << QSPI_WIP_W_TRANSFER_SHIFT)
++#define  QSPI_WIP_W_SCK_SEL_SHIFT	0
++#define  QSPI_WIP_W_SCK_SEL_MASK	(0x7 << QSPI_WIP_W_SCK_SEL_SHIFT)
++
++#define QSPI_WP_REG			0x28
++#define  QSPI_WP_EN_SHIFT		17
++#define  QSPI_WP_EN_MASK		(0x1 << QSPI_WP_EN_SHIFT)
++#define  QSPI_WP_IO2_SHIFT		16
++#define  QSPI_WP_IO2_MASK		(0x1 << QSPI_WP_IO2_SHIFT)
++#define  QSPI_WP_HOLD_SHIFT		8
++#define  QSPI_WP_HOLD_MASK		(0xff << QSPI_WP_HOLD_SHIFT)
++#define  QSPI_WP_SETUP_SHIFT		0
++#define  QSPI_WP_SETUP_MASK		(0xff << QSPI_WP_SETUP_SHIFT)
++
++#define QSPI_MODE_REG			0x2c
++#define  QSPI_MODE_VALID_SHIFT		8
++#define  QSPI_MODE_VALID_MASK		(0xff << QSPI_MODE_VALID_SHIFT)
++#define  QSPI_MODE_SHIFT		0
++#define  QSPI_MODE_MASK			(0xff << QSPI_MODE_SHIFT)
++
++#define PHYTIUM_QSPI_MAX_NORCHIP	4
++#define PHYTIUM_QSPI_MAX_MMAP_SZ	(SZ_256M * PHYTIUM_QSPI_MAX_NORCHIP)
++#define PHYTIUM_QSPI_MAX_XFER_SZ	8
++#define PHYTIUM_QSPI_DEFAULT_SCK_SEL	5
++
++#define XFER_PROTO_1_1_1		0x0
++#define XFER_PROTO_1_1_2		0x1
++#define XFER_PROTO_1_1_4		0x2
++#define XFER_PROTO_1_2_2		0x3
++#define XFER_PROTO_1_4_4		0x4
++#define XFER_PROTO_2_2_2		0x5
++#define XFER_PROTO_4_4_4		0x6
++
++struct phytium_qspi_flash {
++	u32 cs;
++	u32 clk_div;
++
++	void __iomem *base;
++	resource_size_t size;
++	struct spi_device *spi;
++};
++
++struct phytium_qspi {
++	struct device *dev;
++	struct spi_controller *ctrl;
++
++	void __iomem *io_base;
++	void __iomem *mm_base;
++	resource_size_t mm_size;
++	resource_size_t used_size;
++
++	struct clk *clk;
++	u32 clk_rate;
++
++	struct phytium_qspi_flash flash[PHYTIUM_QSPI_MAX_NORCHIP];
++	u8 fnum;
++	bool nodirmap;
++
++	u32 wr_cfg_reg;
++	u32 rd_cfg_reg;
++	u32 flash_cap;
++};
++
++static bool phytium_qspi_check_buswidth(u8 width)
++{
++	switch (width) {
++	case 1:
++	case 2:
++	case 4:
++		return 0;
++	}
++
++	return -ENOTSUPP;
++}
++
++static uint phytium_spi_nor_clac_clk_div(int div)
++{
++	uint clk_div = 0;
++
++	if (div <= 2)
++		clk_div = 1;
++	else if (div <= 4)
++		clk_div = 2;
++	else if (div <= 8)
++		clk_div = 3;
++	else if (div <= 16)
++		clk_div = 4;
++	else if (div <= 32)
++		clk_div = 5;
++	else if (div <= 64)
++		clk_div = 6;
++	else if (div <= 128)
++		clk_div = 7;
++	else
++		clk_div = 65535;
++
++	return clk_div;
++}
++
++static int phytium_spi_nor_protocol_encode(const struct spi_mem_op *op, u32 *code)
++{
++	int ret = 0;
++
++	if (op->cmd.buswidth == 1 &&
++	    op->addr.buswidth == 1 &&
++	    op->data.buswidth == 1)
++		*code = XFER_PROTO_1_1_1;
++	else if (op->cmd.buswidth == 1 &&
++		 op->addr.buswidth == 1 &&
++		 op->data.buswidth == 2)
++		*code = XFER_PROTO_1_1_2;
++	else if (op->cmd.buswidth == 1 &&
++		 op->addr.buswidth == 1 &&
++		 op->data.buswidth == 4)
++		*code = XFER_PROTO_1_1_4;
++	else if (op->cmd.buswidth == 1 &&
++		 op->addr.buswidth == 2 &&
++		 op->data.buswidth == 2)
++		*code = XFER_PROTO_1_2_2;
++	else if (op->cmd.buswidth == 1 &&
++		 op->addr.buswidth == 4 &&
++		 op->data.buswidth == 4)
++		*code = XFER_PROTO_1_4_4;
++	else if (op->cmd.buswidth == 2 &&
++		 op->addr.buswidth == 2 &&
++		 op->data.buswidth == 2)
++		*code = XFER_PROTO_2_2_2;
++	else if (op->cmd.buswidth == 4 &&
++		 op->addr.buswidth == 4 &&
++		 op->data.buswidth == 4)
++		*code = XFER_PROTO_4_4_4;
++	else
++		*code = XFER_PROTO_1_1_1;
++
++	return ret;
++}
++
++static int phytium_qspi_flash_capacity_encode(u32 size, u32 *cap)
++{
++	int ret = 0;
++
++	switch (size) {
++	case SZ_4M:
++		*cap = 0x0;
++		break;
++	case SZ_8M:
++		*cap = 0x1;
++		break;
++	case SZ_16M:
++		*cap = 0x2;
++		break;
++	case SZ_32M:
++		*cap = 0x3;
++		break;
++	case SZ_64M:
++		*cap = 0x4;
++		break;
++	case SZ_128M:
++		*cap = 0x5;
++		break;
++	case SZ_256M:
++		*cap = 0x6;
++		break;
++	case SZ_512M:
++		*cap = 0x7;
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
++static void phytium_qspi_clear_wr(struct phytium_qspi *qspi,
++		struct phytium_qspi_flash *flash)
++{
++	u32 cmd = 0;
++	u32 state = 0;
++	int ret = 0;
++
++	cmd |= 0x05 << QSPI_CMD_PORT_CMD_SHIFT;
++	cmd |= BIT(QSPI_CMD_PORT_TRANSFER_SHIFT);
++	cmd |= flash->cs << QSPI_CMD_PORT_CS_SHIFT;
++
++	writel_relaxed(cmd, qspi->io_base + QSPI_CMD_PORT_REG);
++	readl_relaxed(qspi->io_base + QSPI_LD_PORT_REG);
++
++	ret = readl_poll_timeout(qspi->io_base + QSPI_LD_PORT_REG,
++				 state, !(state & 0x01), 10, 100000);
++	if (ret)
++		dev_err(qspi->dev, "wait device timeout\n");
++
++	/* clear wr_cfg */
++	writel_relaxed(0x0, qspi->io_base + QSPI_WR_CFG_REG);
++}
++
++static int phytium_qspi_write_port(struct phytium_qspi *qspi,
++				   const u8 *buf, const size_t len)
++{
++	u32 bouncebuf[2] = { 0 };
++
++	if (len > PHYTIUM_QSPI_MAX_XFER_SZ) {
++		dev_err(qspi->dev, "WRITE data exceeds 8 bytes.\n");
++		return -EINVAL;
++	}
++
++	memcpy(bouncebuf, buf, len);
++
++	if (len > 4)
++		writel_relaxed(bouncebuf[1], qspi->io_base + QSPI_HD_PORT_REG);
++	writel_relaxed(bouncebuf[0], qspi->io_base + QSPI_LD_PORT_REG);
++
++	return 0;
++}
++
++static int phytium_qspi_read_port(struct phytium_qspi *qspi,
++				  u8 *buf, size_t len)
++{
++	u32 bouncebuf[2] = { 0 };
++
++	if (len > PHYTIUM_QSPI_MAX_XFER_SZ) {
++		dev_err(qspi->dev, "READ data exceeds 8 bytes.\n");
++		return -EINVAL;
++	}
++
++	/* Dummy write to LD_PORT register and issue READ ops*/
++	writel_relaxed(0, qspi->io_base + QSPI_LD_PORT_REG);
++
++	/* Read data */
++	bouncebuf[0] = readl_relaxed(qspi->io_base + QSPI_LD_PORT_REG);
++	if (len > 4)
++		bouncebuf[1] = readl_relaxed(qspi->io_base + QSPI_HD_PORT_REG);
++
++	memcpy(buf, bouncebuf, len);
++
++	return 0;
++}
++
++static int phytium_qspi_adjust_op_size(struct spi_mem *mem,
++					  struct spi_mem_op *op)
++{
++	if (op->data.nbytes > PHYTIUM_QSPI_MAX_XFER_SZ)
++		op->data.nbytes = PHYTIUM_QSPI_MAX_XFER_SZ;
++
++	return 0;
++}
++
++static bool phytium_qspi_supports_op(struct spi_mem *mem,
++				     const struct spi_mem_op *op)
++{
++	int ret;
++
++	ret = phytium_qspi_check_buswidth(op->cmd.buswidth);
++
++	if (op->addr.nbytes)
++		ret |= phytium_qspi_check_buswidth(op->addr.buswidth);
++
++	if (op->dummy.nbytes)
++		ret |= phytium_qspi_check_buswidth(op->dummy.buswidth);
++
++	if (op->data.nbytes)
++		ret |= phytium_qspi_check_buswidth(op->data.buswidth);
++
++	if (ret)
++		return false;
++
++	/* Max 32 dummy clock cycles supported */
++	if (op->dummy.nbytes &&
++	    (op->dummy.nbytes * 8 / op->dummy.buswidth > 32))
++		return false;
++
++	return spi_mem_default_supports_op(mem, op);
++}
++
++static int phytium_qspi_exec_op(struct spi_mem *mem,
++				const struct spi_mem_op *op)
++{
++	struct phytium_qspi *qspi = spi_controller_get_devdata(mem->spi->master);
++	struct phytium_qspi_flash *flash = &qspi->flash[mem->spi->chip_select];
++	u32 cmd, transfer;
++	int ret;
++
++	dev_dbg(qspi->dev, "cmd:%#x mode: %d.%d.%d.%d addr:%#llx len:%#x\n",
++		op->cmd.opcode, op->cmd.buswidth, op->addr.buswidth,
++		op->dummy.buswidth, op->data.buswidth, op->addr.val,
++		op->data.nbytes);
++
++	cmd = op->cmd.opcode << QSPI_CMD_PORT_CMD_SHIFT;
++	cmd |= flash->cs << QSPI_CMD_PORT_CS_SHIFT;
++
++	ret = phytium_spi_nor_protocol_encode(op, &transfer);
++	if (ret) {
++		dev_err(qspi->dev, "Unsupported SPI NOR protocol.\n");
++		goto out;
++	}
++	cmd |= transfer << QSPI_CMD_PORT_TRANSFER_SHIFT;
++
++	if (op->addr.nbytes) {
++		cmd |= QSPI_CMD_PORT_CMD_ADDR_MASK;
++		if (op->addr.nbytes == 4)
++			cmd |= QSPI_CMD_PORT_ADDR_SEL_MASK;
++
++		/* Write target address to ADDR_PORT register */
++		writel_relaxed(op->addr.val, qspi->io_base + QSPI_ADDR_PORT_REG);
++	}
++
++	if (op->dummy.nbytes) {
++		cmd |= QSPI_CMD_PORT_LATENCY_MASK;
++		cmd |= ((op->dummy.nbytes * 8) / op->dummy.buswidth) <<
++			QSPI_CMD_PORT_LATENCY_SHIFT;
++	}
++
++	if (op->data.nbytes) {
++		cmd |= QSPI_CMD_PORT_DATA_XFER_MASK;
++		cmd &= ~QSPI_CMD_PORT_P_BUFFER_MASK;
++		cmd |= (op->data.nbytes-1) << QSPI_CMD_PORT_RW_NUM_SHIFT;
++	}
++
++	cmd |= flash->clk_div;
++	writel_relaxed(cmd, qspi->io_base + QSPI_CMD_PORT_REG);
++
++	if (op->data.dir == SPI_MEM_DATA_IN) {
++		ret = phytium_qspi_read_port(qspi, op->data.buf.in, op->data.nbytes);
++		if (ret) {
++			dev_err(qspi->dev, "Failed to read data from the port.\n");
++			goto out;
++		}
++	} else if (op->data.dir == SPI_MEM_DATA_OUT) {
++		ret = phytium_qspi_write_port(qspi, op->data.buf.out, op->data.nbytes);
++		if (ret) {
++			dev_err(qspi->dev, "Failed to write data to the port.\n");
++			goto out;
++		}
++	} else {
++		/* Dummy write to LD_PORT register and issue the command */
++		writel_relaxed(0, qspi->io_base + QSPI_LD_PORT_REG);
++	}
++
++out:
++	return ret;
++}
++
++static int phytium_qspi_dirmap_create(struct spi_mem_dirmap_desc *desc)
++{
++	struct spi_device *spi = desc->mem->spi;
++	struct phytium_qspi *qspi = spi_controller_get_devdata(spi->master);
++	struct phytium_qspi_flash *flash = &qspi->flash[spi->chip_select];
++	struct spi_nor *nor = spi_mem_get_drvdata(desc->mem);
++	u32 cmd, transfer;
++	int ret = 0;
++
++	if (!qspi->mm_base || !qspi->mm_size) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	if (!flash->base) {
++		flash->base = qspi->mm_base + qspi->used_size;
++		qspi->used_size += nor->mtd.size;
++	}
++
++	/* Setup RD/WR_CFG register */
++	if (desc->info.op_tmpl.data.dir == SPI_MEM_DATA_IN) {
++		cmd = desc->info.op_tmpl.cmd.opcode << QSPI_RD_CFG_RD_CMD_SHIFT;
++		ret = phytium_spi_nor_protocol_encode(&desc->info.op_tmpl, &transfer);
++		if (ret) {
++			dev_err(qspi->dev, "Unsupported SPI NOR protocol.\n");
++			goto out;
++		}
++		cmd |= transfer << QSPI_RD_CFG_RD_TRANSFER_SHIFT;
++
++		if (desc->info.op_tmpl.addr.nbytes == 4)
++			cmd |= QSPI_RD_CFG_RD_ADDR_SEL_MASK;
++
++		if (nor->read_dummy) {
++			cmd |= QSPI_RD_CFG_RD_LATENCY_MASK;
++			cmd |= (nor->read_dummy - 1) << QSPI_RD_CFG_DUMMY_SHIFT;
++		}
++
++		cmd |= QSPI_RD_CFG_D_BUFFER_MASK;
++		cmd |= flash->clk_div & QSPI_RD_CFG_RD_SCK_SEL_MASK;
++
++		writel_relaxed(cmd, qspi->io_base + QSPI_RD_CFG_REG);
++		qspi->rd_cfg_reg = cmd;
++
++		dev_dbg(qspi->dev, "Create read dirmap and setup RD_CFG_REG [%#x].\n", cmd);
++	} else if (desc->info.op_tmpl.data.dir == SPI_MEM_DATA_OUT) {
++		cmd = desc->info.op_tmpl.cmd.opcode << QSPI_WR_CFG_WR_CMD_SHIFT;
++		ret = phytium_spi_nor_protocol_encode(&desc->info.op_tmpl, &transfer);
++		if (ret) {
++			dev_err(qspi->dev, "Unsupported SPI NOR protocol.\n");
++			goto out;
++		}
++		cmd |= transfer << QSPI_WR_CFG_WR_TRANSFER_SHIFT;
++
++		if (desc->info.op_tmpl.addr.nbytes == 4)
++			cmd |= QSPI_WR_CFG_WR_ADDR_SEL_MASK;
++
++		cmd |= QSPI_WR_CFG_WR_MODE_MASK;
++		cmd |= flash->clk_div & QSPI_WR_CFG_WR_SCK_SEL_MASK;
++		qspi->wr_cfg_reg = cmd;
++	} else {
++		ret = -EINVAL;
++	}
++
++out:
++	return ret;
++}
++
++static ssize_t phytium_qspi_dirmap_read(struct spi_mem_dirmap_desc *desc,
++					u64 offs, size_t len, void *buf)
++{
++	struct spi_device *spi = desc->mem->spi;
++	struct phytium_qspi *qspi = spi_controller_get_devdata(spi->master);
++	struct phytium_qspi_flash *flash = &qspi->flash[spi->chip_select];
++
++	void __iomem *src = flash->base + offs;
++	u8 *buf_rx = buf;
++
++	memcpy_fromio(buf_rx, src, len);
++
++	return len;
++}
++
++static ssize_t phytium_qspi_dirmap_write(struct spi_mem_dirmap_desc *desc,
++					 u64 offs, size_t len, const void *buf)
++{
++	struct spi_device *spi = desc->mem->spi;
++	struct phytium_qspi *qspi = spi_controller_get_devdata(spi->master);
++	struct phytium_qspi_flash *flash = &qspi->flash[spi->chip_select];
++
++	void __iomem *dst = flash->base + offs;
++	void __iomem *addr;
++	int i;
++	size_t mask = 0x03;
++	u_char tmp[4] = {0};
++
++	/* set wr_cfg for drimap write */
++	writel_relaxed(qspi->wr_cfg_reg, qspi->io_base + QSPI_WR_CFG_REG);
++
++	if (offs & 0x03) {
++		dev_err(qspi->dev, "Addr not four-byte aligned!\n");
++		return -EINVAL;
++	}
++
++	for (i = 0; i < len / 4; i++)
++		writel_relaxed(*(u32 *)(buf + 4 * i), dst + 4 * i);
++
++	if (len & mask) {
++		addr =  dst + (len & ~mask);
++		memcpy(tmp, buf + (len & ~mask), len & mask);
++		writel_relaxed(*(u32 *)(tmp), addr);
++	}
++
++	//write cache data to flash
++	writel_relaxed(QSPI_FLUSH_EN, qspi->io_base + QSPI_FLUSH_REG);
++
++	phytium_qspi_clear_wr(qspi, flash);
++
++	return len;
++}
++
++static int phytium_qspi_setup(struct spi_device *spi)
++{
++	struct spi_controller *ctrl = spi->master;
++	struct phytium_qspi *qspi = spi_controller_get_devdata(ctrl);
++	struct phytium_qspi_flash *flash;
++	uint clk_div;
++
++	if (ctrl->busy)
++		return -EBUSY;
++
++	flash = &qspi->flash[spi->chip_select];
++
++	flash->cs = spi->chip_select;
++	flash->spi = spi;
++	if (flash->cs >= PHYTIUM_QSPI_MAX_NORCHIP) {
++		dev_err(qspi->dev, "Flash CS is out of range.\n");
++		return -EINVAL;
++	}
++	qspi->fnum++;
++
++
++	if (spi->max_speed_hz) {
++		clk_div = DIV_ROUND_UP(qspi->clk_rate, spi->max_speed_hz);
++		flash->clk_div = phytium_spi_nor_clac_clk_div(clk_div);
++		if (flash->clk_div == 65535) {
++			dev_err(qspi->dev, "qspi maximum frequency setting is error.\n");
++			return -EINVAL;
++		}
++	} else
++		flash->clk_div = PHYTIUM_QSPI_DEFAULT_SCK_SEL;
++
++	return 0;
++}
++
++static struct spi_controller_mem_ops phytium_qspi_mem_ops = {
++	.adjust_op_size = phytium_qspi_adjust_op_size,
++	.supports_op	= phytium_qspi_supports_op,
++	.exec_op	= phytium_qspi_exec_op,
++	.dirmap_create	= phytium_qspi_dirmap_create,
++	.dirmap_read	= phytium_qspi_dirmap_read,
++	.dirmap_write	= phytium_qspi_dirmap_write,
++};
++
++/**
++ * Direct mapping is supported only when all flashes under the controller
++ * are of the same size and the mapping address is continuous. For those
++ * cases which flashes are of different sizes, the driver offered a non-dirmap
++ * mem_ops with which read/write ops is executed through command port.
++ */
++static struct spi_controller_mem_ops phytium_qspi_mem_ops_nodirmap = {
++	.adjust_op_size = phytium_qspi_adjust_op_size,
++	.supports_op	= phytium_qspi_supports_op,
++	.exec_op	= phytium_qspi_exec_op,
++};
++
++/**
++ * phytium_qspi_probe - Probe method for the QSPI driver
++ * @pdev:	Pointer to the platform_device structure
++ *
++ * This function initializes the driver data structures and the hardware.
++ *
++ * Return:	0 on success and error value on failure
++ */
++static int phytium_qspi_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct spi_controller *ctrl;
++	struct resource *res;
++	struct phytium_qspi *qspi;
++	int i, ret;
++	struct spi_mem *mem;
++	struct spi_nor *nor;
++
++	ctrl = spi_alloc_master(dev, sizeof(*qspi));
++	if (!ctrl)
++		return -ENOMEM;
++
++	ctrl->mode_bits = SPI_CPOL | SPI_CPHA |
++			  SPI_RX_DUAL | SPI_RX_QUAD |
++			  SPI_TX_DUAL | SPI_TX_QUAD;
++	ctrl->setup = phytium_qspi_setup;
++	ctrl->num_chipselect = PHYTIUM_QSPI_MAX_NORCHIP;
++	ctrl->dev.of_node = dev->of_node;
++
++	qspi = spi_controller_get_devdata(ctrl);
++	qspi->ctrl = ctrl;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "qspi");
++	qspi->io_base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(qspi->io_base)) {
++		ret = PTR_ERR(qspi->io_base);
++		goto probe_master_put;
++	}
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "qspi_mm");
++	qspi->mm_base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(qspi->mm_base)) {
++		ret = PTR_ERR(qspi->mm_base);
++		goto probe_master_put;
++	}
++
++	qspi->mm_size = resource_size(res);
++	if (qspi->mm_size > PHYTIUM_QSPI_MAX_MMAP_SZ) {
++		ret = -EINVAL;
++		goto probe_master_put;
++	}
++	qspi->used_size = 0;
++
++	qspi->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(qspi->clk)) {
++		ret = PTR_ERR(qspi->clk);
++		goto probe_master_put;
++	}
++
++	qspi->clk_rate = clk_get_rate(qspi->clk);
++	if (!qspi->clk_rate) {
++		ret = -EINVAL;
++		goto probe_master_put;
++	}
++
++	pm_runtime_enable(dev);
++	ret = pm_runtime_get_sync(dev);
++	if (ret < 0) {
++		pm_runtime_put_noidle(dev);
++		goto probe_master_put;
++	}
++
++	ret = clk_prepare_enable(qspi->clk);
++	if (ret) {
++		dev_err(dev, "Failed to enable PCLK of the controller.\n");
++		goto probe_clk_failed;
++	}
++
++	qspi->nodirmap = device_property_present(dev, "no-direct-mapping");
++	ctrl->mem_ops = qspi->nodirmap ?
++			&phytium_qspi_mem_ops_nodirmap :
++			&phytium_qspi_mem_ops;
++
++	qspi->dev = dev;
++	platform_set_drvdata(pdev, qspi);
++
++	ret = devm_spi_register_controller(dev, ctrl);
++	if (ret) {
++		dev_err(dev, "failed to register SPI controller: %d\n", ret);
++		goto probe_setup_failed;
++	}
++
++	if (!qspi->nodirmap) {
++		/*
++		 * The controller supports direct mapping access only if all
++		 * flashes are of same size.
++		 */
++
++		i = 0;
++		for (i = 0; qspi->fnum > i && i < PHYTIUM_QSPI_MAX_NORCHIP; i++) {
++			if (qspi->flash[i].spi) {
++				mem = spi_get_drvdata(qspi->flash[i].spi);
++				if (mem) {
++					nor = spi_mem_get_drvdata(mem);
++					if (nor)
++						qspi->flash[i].size = nor->mtd.size;
++				}
++			}
++		}
++
++		for (i = 1; qspi->fnum > i && i < PHYTIUM_QSPI_MAX_NORCHIP; i++) {
++			if (qspi->flash[i].size != qspi->flash[0].size) {
++				dev_err(dev, "Flashes are of different sizes.\n");
++				ret = -EINVAL;
++				goto probe_setup_failed;
++			}
++		}
++
++		ret = phytium_qspi_flash_capacity_encode(qspi->flash[0].size,
++							 &qspi->flash_cap);
++		if (ret) {
++			dev_err(dev, "Flash size is invalid.\n");
++			goto probe_setup_failed;
++		}
++
++		qspi->flash_cap |= qspi->fnum << QSPI_FLASH_CAP_NUM_SHIFT;
++
++		writel_relaxed(qspi->flash_cap, qspi->io_base + QSPI_FLASH_CAP_REG);
++	}
++
++	return 0;
++
++probe_setup_failed:
++	clk_disable_unprepare(qspi->clk);
++probe_clk_failed:
++	pm_runtime_put_sync(dev);
++	pm_runtime_disable(dev);
++probe_master_put:
++
++	return ret;
++}
++
++/**
++ * phytium_qspi_remove - Remove method for the QSPI driver
++ * @pdev:	Pointer to the platform_device structure
++ *
++ * This function is called if a device is physically removed from the system
++ * or if the driver module is being unloaded. It free all resources allocated
++ * to the device.
++ *
++ * Return:	0 on success and error value on failure
++ */
++static int phytium_qspi_remove(struct platform_device *pdev)
++{
++	struct phytium_qspi *qspi = platform_get_drvdata(pdev);
++
++	clk_disable_unprepare(qspi->clk);
++
++	pm_runtime_put_sync(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++
++	return 0;
++}
++
++static int __maybe_unused phytium_qspi_suspend(struct device *dev)
++{
++	return pm_runtime_force_suspend(dev);
++}
++
++static int __maybe_unused phytium_qspi_resume(struct device *dev)
++{
++	struct phytium_qspi *qspi = dev_get_drvdata(dev);
++
++	/* set rd_cfg reg and flash_capacity reg after resume */
++	writel_relaxed(qspi->rd_cfg_reg, qspi->io_base + QSPI_RD_CFG_REG);
++	writel_relaxed(qspi->flash_cap, qspi->io_base + QSPI_FLASH_CAP_REG);
++	return pm_runtime_force_resume(dev);
++}
++
++static const struct dev_pm_ops phytium_qspi_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(phytium_qspi_suspend,
++				phytium_qspi_resume)
++};
++
++static const struct of_device_id phytium_qspi_of_match[] = {
++	{ .compatible = "phytium,qspi-nor" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, phytium_qspi_of_match);
++
++static struct platform_driver phytium_qspi_driver = {
++	.probe = phytium_qspi_probe,
++	.remove = phytium_qspi_remove,
++	.driver = {
++		.name = "phytium-qspi",
++		.of_match_table = of_match_ptr(phytium_qspi_of_match),
++		.pm = &phytium_qspi_pm_ops,
++	},
++};
++module_platform_driver(phytium_qspi_driver);
++
++MODULE_AUTHOR("Chen Baozi <chenbaozi@phytium.com.cn>");
++MODULE_DESCRIPTION("Phytium Quad SPI driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/spi/spi-phytium.c b/drivers/spi/spi-phytium.c
+new file mode 100644
+index 000000000..4fae2cd2c
+--- /dev/null
++++ b/drivers/spi/spi-phytium.c
+@@ -0,0 +1,509 @@
++ // SPDX-License-Identifier: GPL-2.0
++/*
++ * Phytium SPI core controller driver.
++ *
++ * Copyright (c) 2019-2024 Phytium Technology Co., Ltd.
++ */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/gpio.h>
++#include <linux/highmem.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <linux/scatterlist.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/of_platform.h>
++#include <linux/property.h>
++#include <linux/acpi.h>
++#include "spi-phytium.h"
++
++struct phytium_spi_chip {
++	u8 poll_mode;
++	u8 type;
++	void (*cs_control)(u32 command);
++};
++
++struct chip_data {
++	u8 cs;
++	u8 tmode;
++	u8 type;
++
++	u8 poll_mode;
++
++	u16 clk_div;
++	u32 speed_hz;
++	void (*cs_control)(u32 command);
++};
++
++static void phytium_spi_set_cs(struct spi_device *spi, bool enable)
++{
++	struct phytium_spi *fts = spi_master_get_devdata(spi->master);
++	struct chip_data *chip = spi_get_ctldata(spi);
++	u32 origin;
++
++	if (chip && chip->cs_control)
++		chip->cs_control(!enable);
++
++	if (!enable) {
++		phytium_writel(fts, SER, BIT(spi->chip_select));
++		if (fts->global_cs) {
++			origin = phytium_readl(fts, GCSR);
++			phytium_writel(fts, GCSR, origin | (1 << spi->chip_select));
++		}
++	} else {
++		if (fts->global_cs) {
++			origin = phytium_readl(fts, GCSR);
++			phytium_writel(fts, GCSR, origin & ~(1 << spi->chip_select));
++		}
++	}
++}
++
++static inline u32 tx_max(struct phytium_spi *fts)
++{
++	u32 tx_left, tx_room, rxtx_gap;
++
++	tx_left = (fts->tx_end - fts->tx) / fts->n_bytes;
++	tx_room = fts->fifo_len - phytium_readl(fts, TXFLR);
++
++	rxtx_gap =  ((fts->rx_end - fts->rx) - (fts->tx_end - fts->tx))
++			/ fts->n_bytes;
++
++	return min3(tx_left, tx_room, (u32) (fts->fifo_len - rxtx_gap));
++}
++
++static inline u32 rx_max(struct phytium_spi *fts)
++{
++	u32 rx_left = (fts->rx_end - fts->rx) / fts->n_bytes;
++
++	return min_t(u32, rx_left, phytium_readl(fts, RXFLR));
++}
++
++static void phytium_writer(struct phytium_spi *fts)
++{
++	u32 max = tx_max(fts);
++	u16 txw = 0;
++
++	while (max--) {
++		if (fts->tx_end - fts->len) {
++			if (fts->n_bytes == 1)
++				txw = *(u8 *)(fts->tx);
++			else
++				txw = *(u16 *)(fts->tx);
++		}
++		phytium_write_io_reg(fts, DR, txw);
++		fts->tx += fts->n_bytes;
++	}
++}
++
++static void phytium_reader(struct phytium_spi *fts)
++{
++	u32 max = rx_max(fts);
++	u16 rxw;
++
++	while (max--) {
++		rxw = phytium_read_io_reg(fts, DR);
++		if (fts->rx_end - fts->len) {
++			if (fts->n_bytes == 1)
++				*(u8 *)(fts->rx) = rxw;
++			else
++				*(u16 *)(fts->rx) = rxw;
++		}
++		fts->rx += fts->n_bytes;
++	}
++}
++
++int phytium_spi_check_status(struct phytium_spi *fts, bool raw)
++{
++	u32 irq_status;
++	int ret = 0;
++
++	if (raw)
++		irq_status = phytium_readl(fts, RISR);
++	else
++		irq_status = phytium_readl(fts, ISR);
++
++	if (irq_status & INT_RXOI) {
++		dev_err(&fts->master->dev, "RX FIFO overflow detected\n");
++		ret = -EIO;
++	}
++
++	if (irq_status & INT_RXUI) {
++		dev_err(&fts->master->dev, "RX FIFO underflow detected\n");
++		ret = -EIO;
++	}
++
++	if (irq_status & INT_TXOI) {
++		dev_err(&fts->master->dev, "TX FIFO overflow detected\n");
++		ret = -EIO;
++	}
++
++	/* Generically handle the erroneous situation */
++	if (ret) {
++		spi_reset_chip(fts);
++		if (fts->master->cur_msg)
++			fts->master->cur_msg->status = ret;
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(phytium_spi_check_status);
++
++static void int_error_stop(struct phytium_spi *fts, const char *msg)
++{
++	spi_reset_chip(fts);
++
++	dev_err(&fts->master->dev, "%s\n", msg);
++	fts->master->cur_msg->status = -EIO;
++	spi_finalize_current_transfer(fts->master);
++}
++
++static irqreturn_t interrupt_transfer(struct phytium_spi *fts)
++{
++	u16 irq_status = phytium_readl(fts, ISR);
++
++	if (irq_status & (INT_TXOI | INT_RXOI | INT_RXUI)) {
++		phytium_readl(fts, ICR);
++		int_error_stop(fts, "interrupt_transfer: fifo overrun/underrun");
++		return IRQ_HANDLED;
++	}
++
++	phytium_reader(fts);
++	if (fts->rx_end == fts->rx) {
++		spi_mask_intr(fts, INT_TXEI);
++		spi_finalize_current_transfer(fts->master);
++		return IRQ_HANDLED;
++	}
++	if (irq_status & INT_TXEI) {
++		spi_mask_intr(fts, INT_TXEI);
++		phytium_writer(fts);
++		spi_umask_intr(fts, INT_TXEI);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t phytium_spi_irq(int irq, void *dev_id)
++{
++	struct spi_master *master = dev_id;
++	struct phytium_spi *fts = spi_master_get_devdata(master);
++	u16 irq_status = phytium_readl(fts, ISR) & 0x3f;
++
++	if (!irq_status)
++		return IRQ_NONE;
++
++	if (!master->cur_msg) {
++		spi_mask_intr(fts, INT_TXEI);
++		return IRQ_HANDLED;
++	}
++
++	if (fts->transfer_handler)
++		return fts->transfer_handler(fts);
++	else
++		return IRQ_HANDLED;
++}
++
++static int poll_transfer(struct phytium_spi *fts)
++{
++	do {
++		phytium_writer(fts);
++		phytium_reader(fts);
++		cpu_relax();
++	} while (fts->rx_end > fts->rx);
++
++	return 0;
++}
++
++static int phytium_spi_transfer_one(struct spi_master *master,
++		struct spi_device *spi, struct spi_transfer *transfer)
++{
++	struct phytium_spi *fts = spi_master_get_devdata(master);
++	struct chip_data *chip = spi_get_ctldata(spi);
++	u8 imask = 0;
++	u16 txlevel = 0;
++	u16 clk_div;
++	u32 cr0;
++	int ret = 0;
++
++	fts->dma_mapped = 0;
++	fts->tx = (void *)transfer->tx_buf;
++	fts->tx_end = fts->tx + transfer->len;
++	fts->rx = transfer->rx_buf;
++	fts->rx_end = fts->rx + transfer->len;
++	fts->len = transfer->len;
++
++	spi_enable_chip(fts, 0);
++
++	if (transfer->speed_hz != fts->current_freq) {
++		if (transfer->speed_hz != chip->speed_hz) {
++			clk_div = (fts->max_freq / transfer->speed_hz + 1) &
++				0xfffe;
++
++			chip->speed_hz = transfer->speed_hz;
++			chip->clk_div = clk_div;
++		}
++		fts->current_freq = transfer->speed_hz;
++		spi_set_clk(fts, chip->clk_div);
++	}
++
++	if (transfer->bits_per_word == 8) {
++		fts->n_bytes = 1;
++	} else if (transfer->bits_per_word == 16) {
++		fts->n_bytes = 2;
++	} else {
++		return -EINVAL;
++	}
++
++	cr0 = (transfer->bits_per_word - 1)
++		| (chip->type << FRF_OFFSET)
++		| (spi->mode << MODE_OFFSET)
++		| (chip->tmode << TMOD_OFFSET);
++
++	if (chip->cs_control) {
++		if (fts->rx && fts->tx)
++			chip->tmode = TMOD_TR;
++		else if (fts->rx)
++			chip->tmode = TMOD_RO;
++		else
++			chip->tmode = TMOD_TO;
++
++		cr0 &= ~TMOD_MASK;
++		cr0 |= (chip->tmode << TMOD_OFFSET);
++	}
++
++	phytium_writel(fts, CTRLR0, cr0);
++
++	/* check if current transfer is a DMA transcation */
++	if (master->can_dma && master->can_dma(master, spi, transfer))
++		fts->dma_mapped = master->cur_msg_mapped;
++
++	spi_mask_intr(fts, 0xff);
++
++	/* DMA setup */
++	if (fts->dma_mapped) {
++		ret = fts->dma_ops->dma_setup(fts, transfer);
++		if (ret)
++			return ret;
++	}
++
++	/* interrupt transfer mode setup */
++	if (!chip->poll_mode && !fts->dma_mapped) {
++		txlevel = min_t(u16, fts->fifo_len / 2, fts->len / fts->n_bytes);
++		phytium_writel(fts, TXFLTR, txlevel);
++
++		imask |= INT_TXEI | INT_TXOI |
++			 INT_RXUI | INT_RXOI;
++		spi_umask_intr(fts, imask);
++
++		fts->transfer_handler = interrupt_transfer;
++	}
++
++	spi_enable_chip(fts, 1);
++
++	if (fts->dma_mapped)
++		return fts->dma_ops->dma_transfer(fts, transfer);
++
++	if (chip->poll_mode)
++		return poll_transfer(fts);
++
++	return 1;
++}
++
++static void phytium_spi_handle_err(struct spi_master *master,
++		struct spi_message *msg)
++{
++	struct phytium_spi *fts = spi_master_get_devdata(master);
++
++	if (fts->dma_mapped)
++		fts->dma_ops->dma_stop(fts);
++
++	spi_reset_chip(fts);
++}
++
++static int phytium_spi_setup(struct spi_device *spi)
++{
++	struct phytium_spi_chip *chip_info = NULL;
++	struct chip_data *chip;
++	struct spi_master *master = spi->master;
++	struct phytium_spi *fts = spi_master_get_devdata(master);
++	int ret;
++	u32 cr0;
++
++	spi_enable_chip(fts, 0);
++
++	chip = spi_get_ctldata(spi);
++	if (!chip) {
++		chip = kzalloc(sizeof(struct chip_data), GFP_KERNEL);
++		if (!chip)
++			return -ENOMEM;
++		spi_set_ctldata(spi, chip);
++	}
++
++	chip_info = spi->controller_data;
++
++	if (chip_info) {
++		if (chip_info->cs_control)
++			chip->cs_control = chip_info->cs_control;
++
++		chip->poll_mode = chip_info->poll_mode;
++		chip->type = chip_info->type;
++	}
++
++	chip->tmode = 0;
++
++	cr0 = (spi->bits_per_word - 1) | (chip->type << FRF_OFFSET) |
++	      (spi->mode << MODE_OFFSET) | (chip->tmode << TMOD_OFFSET);
++
++	phytium_writel(fts, CTRLR0, cr0);
++
++	if (gpio_is_valid(spi->cs_gpio)) {
++		ret = gpio_direction_output(spi->cs_gpio,
++				!(spi->mode & SPI_CS_HIGH));
++		if (ret)
++			return ret;
++	}
++
++	spi_enable_chip(fts, 1);
++
++	return 0;
++}
++
++static void phytium_spi_cleanup(struct spi_device *spi)
++{
++	struct chip_data *chip = spi_get_ctldata(spi);
++
++	kfree(chip);
++	spi_set_ctldata(spi, NULL);
++}
++
++static void spi_hw_init(struct device *dev, struct phytium_spi *fts)
++{
++	spi_reset_chip(fts);
++
++	if (!fts->fifo_len) {
++		u32 fifo;
++
++		for (fifo = 1; fifo < 256; fifo++) {
++			phytium_writel(fts, TXFLTR, fifo);
++			if (fifo != phytium_readl(fts, TXFLTR))
++				break;
++		}
++		phytium_writel(fts, TXFLTR, 0);
++
++		fts->fifo_len = (fifo == 1) ? 0 : fifo;
++		dev_dbg(dev, "Detected FIFO size: %u bytes\n", fts->fifo_len);
++	}
++}
++
++int phytium_spi_add_host(struct device *dev, struct phytium_spi *fts)
++{
++	struct spi_master *master;
++	int ret;
++
++	BUG_ON(fts == NULL);
++
++	master = spi_alloc_master(dev, 0);
++	if (!master)
++		return -ENOMEM;
++
++	fts->master = master;
++	fts->dma_addr = (dma_addr_t)(fts->paddr + DR);
++	snprintf(fts->name, sizeof(fts->name), "phytium_spi%d", fts->bus_num);
++
++	spi_hw_init(dev, fts);
++
++	ret = request_irq(fts->irq, phytium_spi_irq, IRQF_SHARED, fts->name, master);
++	if (ret < 0) {
++		dev_err(dev, "can not get IRQ\n");
++		goto err_free_master;
++	}
++
++	master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_LOOP;
++	master->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(16);
++	master->bus_num = fts->bus_num;
++	master->num_chipselect = fts->num_cs;
++	master->setup = phytium_spi_setup;
++	master->cleanup = phytium_spi_cleanup;
++	master->set_cs = phytium_spi_set_cs;
++	master->transfer_one = phytium_spi_transfer_one;
++	master->handle_err = phytium_spi_handle_err;
++	master->max_speed_hz = fts->max_freq;
++	master->dev.of_node = dev->of_node;
++	master->dev.fwnode = dev->fwnode;
++	master->flags = SPI_MASTER_GPIO_SS;
++	master->cs_gpios = fts->cs;
++
++	if (fts->dma_ops && fts->dma_ops->dma_init) {
++		ret = fts->dma_ops->dma_init(dev, fts);
++		if (ret) {
++			dev_warn(dev, "DMA init failed\n");
++		} else {
++			master->can_dma = fts->dma_ops->can_dma;
++			master->flags |= SPI_CONTROLLER_MUST_TX;
++		}
++	}
++
++	spi_master_set_devdata(master, fts);
++	ret = devm_spi_register_master(dev, master);
++	if (ret) {
++		dev_err(&master->dev, "problem registering spi master\n");
++		goto err_exit;
++	}
++
++	return 0;
++
++err_exit:
++	if (fts->dma_ops && fts->dma_ops->dma_exit)
++		fts->dma_ops->dma_exit(fts);
++	spi_enable_chip(fts, 0);
++	free_irq(fts->irq, master);
++err_free_master:
++	spi_master_put(master);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(phytium_spi_add_host);
++
++void phytium_spi_remove_host(struct phytium_spi *fts)
++{
++	if (fts->dma_ops && fts->dma_ops->dma_exit)
++		fts->dma_ops->dma_exit(fts);
++	spi_shutdown_chip(fts);
++
++	free_irq(fts->irq, fts->master);
++}
++EXPORT_SYMBOL_GPL(phytium_spi_remove_host);
++
++int phytium_spi_suspend_host(struct phytium_spi *fts)
++{
++	int ret;
++
++	ret = spi_controller_suspend(fts->master);
++	if (ret)
++		return ret;
++
++	spi_shutdown_chip(fts);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(phytium_spi_suspend_host);
++
++int phytium_spi_resume_host(struct phytium_spi *fts)
++{
++	int ret;
++
++	spi_hw_init(&fts->master->dev, fts);
++	ret = spi_controller_resume(fts->master);
++	if (ret)
++		dev_err(&fts->master->dev, "fail to start queue (%d)\n", ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(phytium_spi_resume_host);
++
++MODULE_AUTHOR("Zhu Mingshuai <zhumingshuai@phytium.com.cn>");
++MODULE_AUTHOR("Chen Baozi <chenbaozi@phytium.com.cn>");
++MODULE_DESCRIPTION("Driver for Phytium SPI controller core");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/spi/spi-phytium.h b/drivers/spi/spi-phytium.h
+new file mode 100644
+index 000000000..003b08f8c
+--- /dev/null
++++ b/drivers/spi/spi-phytium.h
+@@ -0,0 +1,213 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef PHYTIUM_SPI_HEADER_H
++#define PHYTIUM_SPI_HEADER_H
++
++#include <linux/io.h>
++#include <linux/scatterlist.h>
++#include <linux/gpio.h>
++
++#define CTRLR0			0x00
++#define SSIENR			0x08
++#define SER				0x10
++#define BAUDR			0x14
++#define TXFLTR			0x18
++#define TXFLR			0x20
++#define RXFLR			0x24
++#define SR				0x28
++#define IMR				0x2c
++#define ISR				0x30
++#define RISR			0x34
++#define ICR				0x48
++#define DMACR			0x4C
++#define DMATDLR			0x50
++#define DMARDLR			0x54
++#define DR				0x60
++#define GCSR			0x100
++
++#define FRF_OFFSET		4
++#define MODE_OFFSET		6
++#define TMOD_OFFSET		8
++
++#define TMOD_MASK		(0x3 << TMOD_OFFSET)
++#define	TMOD_TR			0x0
++#define TMOD_TO			0x1
++#define TMOD_RO			0x2
++
++#define INT_TXEI		(1 << 0)
++#define INT_TXOI		(1 << 1)
++#define INT_RXUI		(1 << 2)
++#define INT_RXOI		(1 << 3)
++
++/* Bit fields in SR, 7 bits */
++#define SR_MASK				0x7f		/* cover 7 bits */
++#define SR_BUSY				(1 << 0)
++#define SR_TF_NOT_FULL		(1 << 1)
++#define SR_TF_EMPT			(1 << 2)
++#define SR_RF_NOT_EMPT		(1 << 3)
++#define SR_RF_FULL			(1 << 4)
++#define SR_TX_ERR			(1 << 5)
++#define SR_DCOL				(1 << 6)
++
++/* Bit fields in DMACR */
++#define SPI_DMA_RDMAE		(1 << 0)
++#define SPI_DMA_TDMAE		(1 << 1)
++
++#define SPI_WAIT_RETRIES	5
++
++struct phytium_spi;
++
++struct phytium_spi_dma_ops {
++	int (*dma_init)(struct device *dev, struct phytium_spi *fts);
++	void (*dma_exit)(struct phytium_spi *fts);
++	int (*dma_setup)(struct phytium_spi *fts, struct spi_transfer *xfer);
++	bool (*can_dma)(struct spi_controller *master, struct spi_device *spi,
++			struct spi_transfer *xfer);
++	int (*dma_transfer)(struct phytium_spi *fts, struct spi_transfer *xfer);
++	void (*dma_stop)(struct phytium_spi *fts);
++};
++
++struct phytium_spi {
++	struct spi_master	*master;
++	char			name[16];
++
++	void __iomem		*regs;
++	bool			global_cs;
++	bool dma_en;
++	unsigned long		paddr;
++	int			irq;
++	u32			fifo_len;
++	u32			max_freq;
++
++	u32			reg_io_width;
++	u16			bus_num;
++	u16			num_cs;
++	int			*cs;
++
++	size_t			len;
++	void			*tx;
++	void			*tx_end;
++	void			*rx;
++	void			*rx_end;
++	u8				n_bytes;
++	int				dma_mapped;
++	struct clk		*clk;
++	irqreturn_t		(*transfer_handler)(struct phytium_spi *fts);
++	u32				current_freq; /* frequency in hz */
++
++	/* DMA info */
++	struct dma_chan		*txchan;
++	u32			txburst;
++	struct dma_chan		*rxchan;
++	u32			rxburst;
++	u32			dma_sg_burst;
++	unsigned long	dma_chan_busy;
++	dma_addr_t		dma_addr; /* phy address of the Data register */
++	const struct phytium_spi_dma_ops *dma_ops;
++	struct completion	dma_completion;
++};
++
++static inline u32 phytium_readl(struct phytium_spi *fts, u32 offset)
++{
++	return __raw_readl(fts->regs + offset);
++}
++
++static inline u16 phytium_readw(struct phytium_spi *fts, u32 offset)
++{
++	return __raw_readw(fts->regs + offset);
++}
++
++static inline void phytium_writel(struct phytium_spi *fts, u32 offset, u32 val)
++{
++	__raw_writel(val, fts->regs + offset);
++}
++
++static inline void phytium_writew(struct phytium_spi *fts, u32 offset, u16 val)
++{
++	__raw_writew(val, fts->regs + offset);
++}
++
++static inline u32 phytium_read_io_reg(struct phytium_spi *fts, u32 offset)
++{
++	switch (fts->reg_io_width) {
++	case 2:
++		return phytium_readw(fts, offset);
++	case 4:
++	default:
++		return phytium_readl(fts, offset);
++	}
++}
++
++static inline void phytium_write_io_reg(struct phytium_spi *fts, u32 offset, u32 val)
++{
++	switch (fts->reg_io_width) {
++	case 2:
++		phytium_writew(fts, offset, val);
++		break;
++	case 4:
++	default:
++		phytium_writel(fts, offset, val);
++		break;
++	}
++}
++
++static inline void spi_enable_chip(struct phytium_spi *fts, int enable)
++{
++	phytium_writel(fts, SSIENR, (enable ? 1 : 0));
++}
++
++static inline void spi_set_clk(struct phytium_spi *fts, u16 div)
++{
++	phytium_writel(fts, BAUDR, div);
++}
++
++static inline void spi_mask_intr(struct phytium_spi *fts, u32 mask)
++{
++	u32 new_mask;
++
++	new_mask = phytium_readl(fts, IMR) & ~mask;
++	phytium_writel(fts, IMR, new_mask);
++}
++
++static inline void spi_umask_intr(struct phytium_spi *fts, u32 mask)
++{
++	u32 new_mask;
++
++	new_mask = phytium_readl(fts, IMR) | mask;
++	phytium_writel(fts, IMR, new_mask);
++}
++
++static inline void spi_global_cs(struct phytium_spi *fts)
++{
++	u32 global_cs_en, mask, setmask;
++
++	mask = GENMASK(fts->num_cs-1, 0) << fts->num_cs;
++	setmask = ~GENMASK(fts->num_cs-1, 0);
++	global_cs_en = (phytium_readl(fts, GCSR) | mask) & setmask;
++
++	phytium_writel(fts, GCSR, global_cs_en);
++}
++
++static inline void spi_reset_chip(struct phytium_spi *fts)
++{
++	spi_enable_chip(fts, 0);
++	if (fts->global_cs)
++		spi_global_cs(fts);
++	spi_mask_intr(fts, 0xff);
++	spi_enable_chip(fts, 1);
++}
++
++static inline void spi_shutdown_chip(struct phytium_spi *fts)
++{
++	spi_enable_chip(fts, 0);
++	spi_set_clk(fts, 0);
++	fts->current_freq = 0;
++}
++
++extern int phytium_spi_add_host(struct device *dev, struct phytium_spi *fts);
++extern void phytium_spi_remove_host(struct phytium_spi *fts);
++extern int phytium_spi_suspend_host(struct phytium_spi *fts);
++extern int phytium_spi_resume_host(struct phytium_spi *fts);
++extern void phytium_spi_dmaops_set(struct phytium_spi *fts);
++extern int phytium_spi_check_status(struct phytium_spi *fts, bool raw);
++
++#endif /* PHYTIUM_SPI_HEADER_H */
+-- 
+2.25.1
+

@@ -1,0 +1,79 @@
+From b071cf0b03f1dccb0d03b90afce00c52f9d4c878 Mon Sep 17 00:00:00 2001
+From: qianj <qianj@centec.com>
+Date: Wed, 24 Sep 2025 10:52:06 +0800
+Subject: [PATCH 6/6] add spi config boya
+
+---
+ drivers/mtd/spi-nor/Makefile |  1 +
+ drivers/mtd/spi-nor/boya.c   | 21 +++++++++++++++++++++
+ drivers/mtd/spi-nor/core.c   |  1 +
+ drivers/mtd/spi-nor/core.h   |  1 +
+ 4 files changed, 24 insertions(+)
+ create mode 100644 drivers/mtd/spi-nor/boya.c
+
+diff --git a/drivers/mtd/spi-nor/Makefile b/drivers/mtd/spi-nor/Makefile
+index 653923896..ca91ca6b9 100644
+--- a/drivers/mtd/spi-nor/Makefile
++++ b/drivers/mtd/spi-nor/Makefile
+@@ -17,6 +17,7 @@ spi-nor-objs			+= sst.o
+ spi-nor-objs			+= winbond.o
+ spi-nor-objs			+= xilinx.o
+ spi-nor-objs			+= xmc.o
++spi-nor-objs			+= boya.o
+ obj-$(CONFIG_MTD_SPI_NOR)	+= spi-nor.o
+ 
+ obj-$(CONFIG_MTD_SPI_NOR)	+= controllers/
+diff --git a/drivers/mtd/spi-nor/boya.c b/drivers/mtd/spi-nor/boya.c
+new file mode 100644
+index 000000000..db8c0c218
+--- /dev/null
++++ b/drivers/mtd/spi-nor/boya.c
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2005, Intec Automation Inc.
++ * Copyright (C) 2014, Freescale Semiconductor, Inc.
++ */
++
++#include <linux/mtd/spi-nor.h>
++
++#include "core.h"
++
++static const struct flash_info boya_parts[] = {
++	/* Boya Microelectronics Memory Series */
++	{ "by25q64as",  INFO(0x684017, 0, 64 * 1024,  128, SECT_4K) },
++	{ "by25q128as", INFO(0x684018, 0, 64 * 1024,  256, SECT_4K) },
++};
++
++const struct spi_nor_manufacturer spi_nor_boya = {
++	.name = "boya",
++	.parts = boya_parts,
++	.nparts = ARRAY_SIZE(boya_parts),
++};
+diff --git a/drivers/mtd/spi-nor/core.c b/drivers/mtd/spi-nor/core.c
+index 93a1e5431..0fd90367f 100644
+--- a/drivers/mtd/spi-nor/core.c
++++ b/drivers/mtd/spi-nor/core.c
+@@ -2039,6 +2039,7 @@ static const struct spi_nor_manufacturer *manufacturers[] = {
+ 	&spi_nor_winbond,
+ 	&spi_nor_xilinx,
+ 	&spi_nor_xmc,
++	&spi_nor_boya,
+ };
+ 
+ static const struct flash_info *
+diff --git a/drivers/mtd/spi-nor/core.h b/drivers/mtd/spi-nor/core.h
+index 788775bb6..16a0e3a53 100644
+--- a/drivers/mtd/spi-nor/core.h
++++ b/drivers/mtd/spi-nor/core.h
+@@ -398,6 +398,7 @@ extern const struct spi_nor_manufacturer spi_nor_sst;
+ extern const struct spi_nor_manufacturer spi_nor_winbond;
+ extern const struct spi_nor_manufacturer spi_nor_xilinx;
+ extern const struct spi_nor_manufacturer spi_nor_xmc;
++extern const struct spi_nor_manufacturer spi_nor_boya;
+ 
+ int spi_nor_write_enable(struct spi_nor *nor);
+ int spi_nor_write_disable(struct spi_nor *nor);
+-- 
+2.25.1
+
