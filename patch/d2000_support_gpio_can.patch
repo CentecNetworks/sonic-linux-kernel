@@ -1,0 +1,3018 @@
+commit 9d0d46cd5a6d3432c6acf65559909f074cb1a32e
+Author: qianj <qianj@centec.com>
+Date:   Thu Jan 15 06:54:37 2026 +0000
+
+    support d2000 gpio and can
+
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+old mode 100644
+new mode 100755
+index 39f3e1366..7c93abd3f
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -108,6 +108,10 @@ config GPIO_REGMAP
+ config GPIO_MAX730X
+ 	tristate
+ 
++# This symbol is selected by both MMIO and PCI expanders
++config GPIO_PHYTIUM_CORE
++	tristate
++
+ menu "Memory mapped GPIO drivers"
+ 	depends on HAS_IOMEM
+ 
+@@ -739,6 +743,27 @@ config GPIO_AMD_FCH
+ 	  Note: This driver doesn't registers itself automatically, as it
+ 	  needs to be provided with platform specific configuration.
+ 	  (See eg. CONFIG_PCENGINES_APU2.)
++
++config GPIO_PHYTIUM_PLAT
++	tristate "Phytium GPIO Platform support"
++	default y if ARCH_PHYTIUM
++	depends on ARM64
++	select GPIO_PHYTIUM_CORE
++	select IRQ_DOMAIN
++	select GENERIC_IRQ_CHIP
++	select GPIOLIB_IRQCHIP
++	help
++	  Say yes here to enable GPIO support for Phytium SoCs.
++
++config GPIO_PHYTIUM_SGPIO
++	tristate "Phytium SGPIO support"
++	default y if ARCH_PHYTIUM
++	depends on ARM64
++	select IRQ_DOMAIN
++	select GENERIC_IRQ_CHIP
++	help
++	  Say yes here to enable SGPIO support for Phytium SoCs.
++
+ endmenu
+ 
+ menu "Port-mapped I/O GPIO drivers"
+@@ -1520,6 +1545,20 @@ config GPIO_SODAVILLE
+ 	help
+ 	  Say Y here to support Intel Sodaville GPIO.
+ 
++
++config GPIO_PHYTIUM_PCI
++	tristate "Phytium GPIO PCI support"
++	select GPIO_PHYTIUM_CORE
++	select IRQ_DOMAIN
++	select GENERIC_IRQ_CHIP
++	select GPIOLIB_IRQCHIP
++	help
++	  Say Y here to support Phytium PCI GPIO controller on px210 chipset.
++	  An interrupt is generated when any of the inputs change state
++	  (low to high or high to low).
++
++	  This driver can be used for Phytium px210.
++
+ endmenu
+ 
+ menu "SPI GPIO expanders"
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+old mode 100644
+new mode 100755
+index 09dada80a..67dea5151
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -180,3 +180,8 @@ obj-$(CONFIG_GPIO_XTENSA)		+= gpio-xtensa.o
+ obj-$(CONFIG_GPIO_ZEVIO)		+= gpio-zevio.o
+ obj-$(CONFIG_GPIO_ZX)			+= gpio-zx.o
+ obj-$(CONFIG_GPIO_ZYNQ)			+= gpio-zynq.o
++
++obj-$(CONFIG_GPIO_PHYTIUM_CORE)		+= gpio-phytium-core.o
++obj-$(CONFIG_GPIO_PHYTIUM_PCI)		+= gpio-phytium-pci.o
++obj-$(CONFIG_GPIO_PHYTIUM_PLAT)		+= gpio-phytium-platform.o
++obj-$(CONFIG_GPIO_PHYTIUM_SGPIO)	+= gpio-phytium-sgpio.o
+diff --git a/drivers/gpio/gpio-phytium-core.c b/drivers/gpio/gpio-phytium-core.c
+new file mode 100755
+index 000000000..a1794f55a
+--- /dev/null
++++ b/drivers/gpio/gpio-phytium-core.c
+@@ -0,0 +1,363 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2019-2024 Phytium Technology Co., Ltd.
++ */
++
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/module.h>
++#include <linux/bitops.h>
++
++#include "gpio-phytium-core.h"
++
++static int get_pin_location(struct phytium_gpio *gpio, unsigned int offset,
++		     struct pin_loc *pl)
++{
++	int ret;
++
++	if (offset < gpio->ngpio[0]) {
++		pl->port = 0;
++		pl->offset = offset;
++		ret = 0;
++	} else if (offset < (gpio->ngpio[0] + gpio->ngpio[1])) {
++		pl->port = 1;
++		pl->offset = offset - gpio->ngpio[0];
++		ret = 0;
++	} else {
++		ret = -EINVAL;
++	}
++
++	return ret;
++}
++
++static void phytium_gpio_toggle_trigger(struct phytium_gpio *gpio,
++				 unsigned int offset)
++{
++	struct gpio_chip *gc;
++	u32 pol;
++	int val;
++
++	/* Only port A can provide interrupt source */
++	if (offset >= gpio->ngpio[0])
++		return;
++
++	gc = &gpio->gc;
++
++	pol = readl(gpio->regs + GPIO_INT_POLARITY);
++	/* Just read the current value right out of the data register */
++	val = gc->get(gc, offset);
++	if (val)
++		pol &= ~BIT(offset);
++	else
++		pol |= BIT(offset);
++
++	writel(pol, gpio->regs + GPIO_INT_POLARITY);
++}
++
++int phytium_gpio_get(struct gpio_chip *gc, unsigned int offset)
++{
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	struct pin_loc loc;
++	void __iomem *dat;
++
++	if (get_pin_location(gpio, offset, &loc))
++		return -EINVAL;
++
++	dat = gpio->regs + GPIO_EXT_PORTA + (loc.port * GPIO_PORT_STRIDE);
++
++	return !!(readl(dat) & BIT(loc.offset));
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_get);
++
++void phytium_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
++{
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	struct pin_loc loc;
++	void __iomem *dr;
++	unsigned long flags;
++	u32 mask;
++
++	if (get_pin_location(gpio, offset, &loc))
++		return;
++	dr = gpio->regs + GPIO_SWPORTA_DR + (loc.port * GPIO_PORT_STRIDE);
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	if (value)
++		mask = readl(dr) | BIT(loc.offset);
++	else
++		mask = readl(dr) & ~BIT(loc.offset);
++
++	writel(mask, dr);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_set);
++
++int phytium_gpio_direction_input(struct gpio_chip *gc, unsigned int offset)
++{
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	struct pin_loc loc;
++	unsigned long flags;
++	void __iomem *ddr;
++
++	if (get_pin_location(gpio, offset, &loc))
++		return -EINVAL;
++	ddr = gpio->regs + GPIO_SWPORTA_DDR + (loc.port * GPIO_PORT_STRIDE);
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	writel(readl(ddr) & ~(BIT(loc.offset)), ddr);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_direction_input);
++
++int phytium_gpio_direction_output(struct gpio_chip *gc, unsigned int offset,
++				  int value)
++{
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	struct pin_loc loc;
++	unsigned long flags;
++	void __iomem *ddr;
++
++	if (get_pin_location(gpio, offset, &loc))
++		return -EINVAL;
++	ddr = gpio->regs + GPIO_SWPORTA_DDR + (loc.port * GPIO_PORT_STRIDE);
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	writel(readl(ddr) | BIT(loc.offset), ddr);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++
++	phytium_gpio_set(gc, offset, value);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_direction_output);
++
++void phytium_gpio_irq_ack(struct irq_data *d)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	u32 val = BIT(irqd_to_hwirq(d));
++
++	raw_spin_lock(&gpio->lock);
++
++	writel(val, gpio->regs + GPIO_PORTA_EOI);
++
++	raw_spin_unlock(&gpio->lock);
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_irq_ack);
++
++void phytium_gpio_irq_mask(struct irq_data *d)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	u32 val;
++
++	/* Only port A can provide interrupt source */
++	if (irqd_to_hwirq(d) >= gpio->ngpio[0])
++		return;
++
++	raw_spin_lock(&gpio->lock);
++
++	val = readl(gpio->regs + GPIO_INTMASK);
++	val |= BIT(irqd_to_hwirq(d));
++	writel(val, gpio->regs + GPIO_INTMASK);
++
++	raw_spin_unlock(&gpio->lock);
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_irq_mask);
++
++void phytium_gpio_irq_unmask(struct irq_data *d)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	u32 val;
++
++	/* Only port A can provide interrupt source */
++	if (irqd_to_hwirq(d) >= gpio->ngpio[0])
++		return;
++
++	raw_spin_lock(&gpio->lock);
++
++	val = readl(gpio->regs + GPIO_INTMASK);
++	val &= ~BIT(irqd_to_hwirq(d));
++	writel(val, gpio->regs + GPIO_INTMASK);
++
++	raw_spin_unlock(&gpio->lock);
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_irq_unmask);
++
++int phytium_gpio_irq_set_type(struct irq_data *d, unsigned int flow_type)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	int hwirq = irqd_to_hwirq(d);
++	unsigned long flags, lvl, pol;
++
++	if (hwirq < 0 || hwirq >= gpio->ngpio[0])
++		return -EINVAL;
++
++	if ((flow_type & (IRQ_TYPE_LEVEL_HIGH | IRQ_TYPE_LEVEL_LOW)) &&
++	    (flow_type & (IRQ_TYPE_EDGE_RISING | IRQ_TYPE_EDGE_FALLING))) {
++		dev_err(gc->parent,
++			"trying to configure line %d for both level and edge detection, choose one!\n",
++			hwirq);
++		return -EINVAL;
++	}
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	lvl = readl(gpio->regs + GPIO_INTTYPE_LEVEL);
++	pol = readl(gpio->regs + GPIO_INT_POLARITY);
++
++	switch (flow_type) {
++	case IRQ_TYPE_EDGE_BOTH:
++		lvl |= BIT(hwirq);
++		phytium_gpio_toggle_trigger(gpio, hwirq);
++		irq_set_handler_locked(d, handle_edge_irq);
++		dev_dbg(gc->parent, "line %d: IRQ on both edges\n", hwirq);
++		break;
++	case IRQ_TYPE_EDGE_RISING:
++		lvl |= BIT(hwirq);
++		pol |= BIT(hwirq);
++		irq_set_handler_locked(d, handle_edge_irq);
++		dev_dbg(gc->parent, "line %d: IRQ on RISING edge\n", hwirq);
++		break;
++	case IRQ_TYPE_EDGE_FALLING:
++		lvl |= BIT(hwirq);
++		pol &= ~BIT(hwirq);
++		irq_set_handler_locked(d, handle_edge_irq);
++		dev_dbg(gc->parent, "line %d: IRQ on FALLING edge\n", hwirq);
++		break;
++	case IRQ_TYPE_LEVEL_HIGH:
++		lvl &= ~BIT(hwirq);
++		pol |= BIT(hwirq);
++		irq_set_handler_locked(d, handle_level_irq);
++		dev_dbg(gc->parent, "line %d: IRQ on HIGH level\n", hwirq);
++		break;
++	case IRQ_TYPE_LEVEL_LOW:
++		lvl &= ~BIT(hwirq);
++		pol &= ~BIT(hwirq);
++		irq_set_handler_locked(d, handle_level_irq);
++		dev_dbg(gc->parent, "line %d: IRQ on LOW level\n", hwirq);
++		break;
++	}
++
++	writel(lvl, gpio->regs + GPIO_INTTYPE_LEVEL);
++	if (flow_type != IRQ_TYPE_EDGE_BOTH)
++		writel(pol, gpio->regs + GPIO_INT_POLARITY);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_irq_set_type);
++
++void phytium_gpio_irq_enable(struct irq_data *d)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	unsigned long flags;
++	u32 val;
++
++	/* Only port A can provide interrupt source */
++	if (irqd_to_hwirq(d) >= gpio->ngpio[0])
++		return;
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	val = readl(gpio->regs + GPIO_INTEN);
++	val |= BIT(irqd_to_hwirq(d));
++	writel(val, gpio->regs + GPIO_INTEN);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_irq_enable);
++
++void phytium_gpio_irq_disable(struct irq_data *d)
++{
++	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	unsigned long flags;
++	u32 val;
++
++	/* Only port A can provide interrupt source */
++	if (irqd_to_hwirq(d) >= gpio->ngpio[0])
++		return;
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	val = readl(gpio->regs + GPIO_INTEN);
++	val &= ~BIT(irqd_to_hwirq(d));
++	writel(val, gpio->regs + GPIO_INTEN);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_irq_disable);
++
++void phytium_gpio_irq_handler(struct irq_desc *desc)
++{
++	struct gpio_chip *gc = irq_desc_get_handler_data(desc);
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	struct irq_chip *irqchip = irq_desc_get_chip(desc);
++	unsigned long pending;
++	int offset;
++
++	chained_irq_enter(irqchip, desc);
++
++	pending = readl(gpio->regs + GPIO_INTSTATUS);
++	if (pending) {
++		for_each_set_bit(offset, &pending, gpio->ngpio[0]) {
++			int gpio_irq = irq_find_mapping(gc->irq.domain,
++							offset);
++			generic_handle_irq(gpio_irq);
++
++			if ((irq_get_trigger_type(gpio_irq) &
++			    IRQ_TYPE_SENSE_MASK) == IRQ_TYPE_EDGE_BOTH)
++				phytium_gpio_toggle_trigger(gpio, offset);
++		}
++	}
++
++	chained_irq_exit(irqchip, desc);
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_irq_handler);
++
++int phytium_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
++{
++	struct phytium_gpio *gpio = gpiochip_get_data(gc);
++	struct pin_loc loc;
++	void __iomem *ddr;
++
++	if (get_pin_location(gpio, offset, &loc))
++		return -EINVAL;
++	ddr = gpio->regs + GPIO_SWPORTA_DDR + (loc.port * GPIO_PORT_STRIDE);
++
++	return !(readl(ddr) & BIT(loc.offset));
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_get_direction);
++
++#if CONFIG_SMP
++int
++phytium_gpio_irq_set_affinity(struct irq_data *d, const struct cpumask *mask_val, bool force)
++{
++	struct gpio_chip *chip_data = irq_data_get_irq_chip_data(d);
++	struct irq_chip *chip = irq_get_chip(*(chip_data->irq.parents));
++	struct irq_data *data = irq_get_irq_data(*(chip_data->irq.parents));
++
++	if (chip && chip->irq_set_affinity)
++		return chip->irq_set_affinity(data, mask_val, force);
++
++	return -EINVAL;
++}
++EXPORT_SYMBOL_GPL(phytium_gpio_irq_set_affinity);
++#endif
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Phytium GPIO Controller core");
+diff --git a/drivers/gpio/gpio-phytium-core.h b/drivers/gpio/gpio-phytium-core.h
+new file mode 100755
+index 000000000..d45a9ab11
+--- /dev/null
++++ b/drivers/gpio/gpio-phytium-core.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2021-2024 Phytium Technology Co., Ltd.
++ */
++
++#ifndef _GPIO_PHYTIUM_H
++#define _GPIO_PHYTIUM_H
++
++#include <linux/gpio/driver.h>
++#include <linux/spinlock.h>
++
++#include "gpiolib.h"
++
++#define GPIO_SWPORTA_DR		0x00 /* WR Port A Output Data Register */
++#define GPIO_SWPORTA_DDR	0x04 /* WR Port A Data Direction Register */
++#define GPIO_EXT_PORTA		0x08 /* RO Port A Input Data Register */
++#define GPIO_SWPORTB_DR		0x0c /* WR Port B Output Data Register */
++#define GPIO_SWPORTB_DDR	0x10 /* WR Port B Data Direction Register */
++#define GPIO_EXT_PORTB		0x14 /* RO Port B Input Data Register */
++
++#define GPIO_INTEN		0x18 /* WR Port A Interrput Enable Register */
++#define GPIO_INTMASK		0x1c /* WR Port A Interrupt Mask Register */
++#define GPIO_INTTYPE_LEVEL	0x20 /* WR Port A Interrupt Level Register */
++#define GPIO_INT_POLARITY	0x24 /* WR Port A Interrupt Polarity Register */
++#define GPIO_INTSTATUS		0x28 /* RO Port A Interrupt Status Register */
++#define GPIO_RAW_INTSTATUS	0x2c /* RO Port A Raw Interrupt Status Register */
++#define GPIO_LS_SYNC		0x30 /* WR Level-sensitive Synchronization Enable Register */
++#define GPIO_DEBOUNCE		0x34 /* WR Debounce Enable Register */
++#define GPIO_PORTA_EOI		0x38 /* WO Port A Clear Interrupt Register */
++
++#define MAX_NPORTS		2
++#define NGPIO_DEFAULT		8
++#define NGPIO_MAX		32
++#define GPIO_PORT_STRIDE	(GPIO_EXT_PORTB - GPIO_EXT_PORTA)
++
++struct pin_loc {
++	unsigned int port;
++	unsigned int offset;
++};
++
++#ifdef CONFIG_PM_SLEEP
++struct phytium_gpio_ctx {
++	u32 swporta_dr;
++	u32 swporta_ddr;
++	u32 ext_porta;
++	u32 swportb_dr;
++	u32 swportb_ddr;
++	u32 ext_portb;
++	u32 inten;
++	u32 intmask;
++	u32 inttype_level;
++	u32 int_polarity;
++	u32 intstatus;
++	u32 raw_intstatus;
++	u32 ls_sync;
++	u32 debounce;
++};
++#endif
++
++struct phytium_gpio {
++	raw_spinlock_t		lock;
++	void __iomem		*regs;
++	struct gpio_chip	gc;
++	struct irq_chip		irq_chip;
++	unsigned int		ngpio[2];
++	int			irq[32];
++#ifdef CONFIG_PM_SLEEP
++	struct phytium_gpio_ctx	ctx;
++#endif
++};
++
++int phytium_gpio_get(struct gpio_chip *gc, unsigned int offset);
++void phytium_gpio_set(struct gpio_chip *gc, unsigned int offset, int value);
++
++int phytium_gpio_get_direction(struct gpio_chip *gc, unsigned int offset);
++int phytium_gpio_direction_input(struct gpio_chip *gc, unsigned int offset);
++int phytium_gpio_direction_output(struct gpio_chip *gc, unsigned int offset, int value);
++
++void phytium_gpio_irq_ack(struct irq_data *d);
++void phytium_gpio_irq_mask(struct irq_data *d);
++void phytium_gpio_irq_unmask(struct irq_data *d);
++int phytium_gpio_irq_set_type(struct irq_data *d, unsigned int flow_type);
++void phytium_gpio_irq_enable(struct irq_data *d);
++void phytium_gpio_irq_disable(struct irq_data *d);
++void phytium_gpio_irq_handler(struct irq_desc *desc);
++int phytium_gpio_irq_set_affinity(struct irq_data *d, const struct cpumask *mask_val, bool force);
++#endif
+diff --git a/drivers/gpio/gpio-phytium-pci.c b/drivers/gpio/gpio-phytium-pci.c
+new file mode 100755
+index 000000000..e68772dd7
+--- /dev/null
++++ b/drivers/gpio/gpio-phytium-pci.c
+@@ -0,0 +1,187 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2021-2024 Phytium Technology Co., Ltd.
++ */
++
++#include <linux/err.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++
++#include "gpio-phytium-core.h"
++
++static int phytium_gpio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	struct device *dev = &pdev->dev;
++	struct phytium_gpio *gpio;
++	struct gpio_irq_chip *girq;
++	int err;
++
++	gpio = devm_kzalloc(&pdev->dev, sizeof(*gpio), GFP_KERNEL);
++	if (!gpio)
++		return -ENOMEM;
++
++	err = pcim_enable_device(pdev);
++	if (err) {
++		dev_err(dev, "Failed to enable PCI device: err %d\n", err);
++		goto out;
++	}
++
++	err = pcim_iomap_regions(pdev, 1 << 0, pci_name(pdev));
++	if (err) {
++		dev_err(dev, "Failed to iomap PCI device: err %d\n", err);
++		goto out;
++	}
++
++	gpio->regs = pcim_iomap_table(pdev)[0];
++	if (!gpio->regs) {
++		dev_err(dev, "Cannot map PCI resource\n");
++		err = -ENOMEM;
++		goto out;
++	}
++
++	err = pci_enable_msi(pdev);
++	if (err < 0)
++		goto out;
++
++	pci_set_master(pdev);
++
++	gpio->irq[0] = pdev->irq;
++	if (gpio->irq[0] < 0)
++		dev_warn(dev, "no irq is found.\n");
++
++	/* There is only one group of Pins at the moment. */
++	gpio->ngpio[0] = NGPIO_MAX;
++
++	/* irq_chip support */
++	gpio->irq_chip.name = dev_name(dev);
++	gpio->irq_chip.irq_ack = phytium_gpio_irq_ack;
++	gpio->irq_chip.irq_mask = phytium_gpio_irq_mask;
++	gpio->irq_chip.irq_unmask = phytium_gpio_irq_unmask;
++	gpio->irq_chip.irq_set_type = phytium_gpio_irq_set_type;
++	gpio->irq_chip.irq_enable = phytium_gpio_irq_enable;
++	gpio->irq_chip.irq_disable = phytium_gpio_irq_disable;
++
++	raw_spin_lock_init(&gpio->lock);
++
++	gpio->gc.base = -1;
++	gpio->gc.get_direction = phytium_gpio_get_direction;
++	gpio->gc.direction_input = phytium_gpio_direction_input;
++	gpio->gc.direction_output = phytium_gpio_direction_output;
++	gpio->gc.get = phytium_gpio_get;
++	gpio->gc.set = phytium_gpio_set;
++	gpio->gc.ngpio = gpio->ngpio[0] + gpio->ngpio[1];
++	gpio->gc.label = dev_name(dev);
++	gpio->gc.parent = dev;
++	gpio->gc.owner = THIS_MODULE;
++
++	girq = &gpio->gc.irq;
++	girq->handler = handle_bad_irq;
++	girq->default_type = IRQ_TYPE_NONE;
++
++	girq->num_parents = 1;
++	girq->parents = devm_kcalloc(&pdev->dev, girq->num_parents,
++				     sizeof(*girq->parents), GFP_KERNEL);
++	if (!girq->parents)
++		return -ENOMEM;
++	girq->parents[0] = gpio->irq[0];
++	girq->parent_handler = phytium_gpio_irq_handler;
++
++	girq->chip = &gpio->irq_chip;
++
++	err = devm_gpiochip_add_data(dev, &gpio->gc, gpio);
++	if (err)
++		goto out;
++
++	dev_info(dev, "Phytium PCI GPIO controller @%pa registered\n",
++		&gpio->regs);
++
++	pci_set_drvdata(pdev, gpio);
++
++out:
++	return err;
++}
++
++static const struct pci_device_id phytium_gpio_pci_ids[] = {
++	{ PCI_DEVICE(0x1DB7, 0xDC31) },
++	{ 0 }
++};
++MODULE_DEVICE_TABLE(pci, phytium_gpio_pci_ids);
++
++#ifdef CONFIG_PM_SLEEP
++static int phytium_gpio_pci_suspend(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct phytium_gpio *gpio = pci_get_drvdata(pdev);
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	gpio->ctx.swporta_dr = readl(gpio->regs + GPIO_SWPORTA_DR);
++	gpio->ctx.swporta_ddr = readl(gpio->regs + GPIO_SWPORTA_DDR);
++	gpio->ctx.ext_porta = readl(gpio->regs + GPIO_EXT_PORTA);
++	gpio->ctx.swportb_dr = readl(gpio->regs + GPIO_SWPORTB_DR);
++	gpio->ctx.swportb_ddr = readl(gpio->regs + GPIO_SWPORTB_DDR);
++	gpio->ctx.ext_portb = readl(gpio->regs + GPIO_EXT_PORTB);
++
++	gpio->ctx.inten = readl(gpio->regs + GPIO_INTEN);
++	gpio->ctx.intmask = readl(gpio->regs + GPIO_INTMASK);
++	gpio->ctx.inttype_level = readl(gpio->regs + GPIO_INTTYPE_LEVEL);
++	gpio->ctx.int_polarity = readl(gpio->regs + GPIO_INT_POLARITY);
++	gpio->ctx.debounce = readl(gpio->regs + GPIO_DEBOUNCE);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++
++	return 0;
++}
++
++static int phytium_gpio_pci_resume(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct phytium_gpio *gpio = pci_get_drvdata(pdev);
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	writel(gpio->ctx.swporta_dr, gpio->regs + GPIO_SWPORTA_DR);
++	writel(gpio->ctx.swporta_ddr, gpio->regs + GPIO_SWPORTA_DDR);
++	writel(gpio->ctx.ext_porta, gpio->regs + GPIO_EXT_PORTA);
++	writel(gpio->ctx.swportb_dr, gpio->regs + GPIO_SWPORTB_DR);
++	writel(gpio->ctx.swportb_ddr, gpio->regs + GPIO_SWPORTB_DDR);
++	writel(gpio->ctx.ext_portb, gpio->regs + GPIO_EXT_PORTB);
++
++	writel(gpio->ctx.inten, gpio->regs + GPIO_INTEN);
++	writel(gpio->ctx.intmask, gpio->regs + GPIO_INTMASK);
++	writel(gpio->ctx.inttype_level, gpio->regs + GPIO_INTTYPE_LEVEL);
++	writel(gpio->ctx.int_polarity, gpio->regs + GPIO_INT_POLARITY);
++	writel(gpio->ctx.debounce, gpio->regs + GPIO_DEBOUNCE);
++
++	writel(0xffffffff, gpio->regs + GPIO_PORTA_EOI);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++
++	return 0;
++}
++#endif
++
++static SIMPLE_DEV_PM_OPS(phytium_gpio_pci_pm_ops,
++			 phytium_gpio_pci_suspend,
++			 phytium_gpio_pci_resume);
++
++static struct pci_driver phytium_gpio_pci_driver = {
++	.name		= "gpio-phytium-pci",
++	.id_table	= phytium_gpio_pci_ids,
++	.probe		= phytium_gpio_pci_probe,
++	.driver		= {
++		.pm	= &phytium_gpio_pci_pm_ops,
++	},
++};
++
++module_pci_driver(phytium_gpio_pci_driver);
++
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("Cheng Quan <chengquan@phytium.com.cn>");
++MODULE_DESCRIPTION("Phytium GPIO PCI Driver");
+diff --git a/drivers/gpio/gpio-phytium-platform.c b/drivers/gpio/gpio-phytium-platform.c
+new file mode 100755
+index 000000000..9fe3191f7
+--- /dev/null
++++ b/drivers/gpio/gpio-phytium-platform.c
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Support functions for Phytium GPIO
++ *
++ * Copyright (c) 2019-2024 Phytium Technology Co., Ltd.
++ *
++ * Derived from drivers/gpio/gpio-pl061.c
++ *   Copyright (C) 2008, 2009 Provigent Ltd.
++ */
++
++#include <linux/acpi.h>
++#include <linux/err.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++
++#include "gpio-phytium-core.h"
++
++static const struct of_device_id phytium_gpio_of_match[] = {
++	{ .compatible = "phytium,gpio", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, phytium_gpio_of_match);
++
++static const struct acpi_device_id phytium_gpio_acpi_match[] = {
++	{ "PHYT0001", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(acpi, phytium_gpio_acpi_match);
++
++static int phytium_gpio_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct phytium_gpio *gpio;
++	struct gpio_irq_chip *girq;
++	struct fwnode_handle *fwnode;
++	int err, irq_count;
++
++	gpio = devm_kzalloc(&pdev->dev, sizeof(*gpio), GFP_KERNEL);
++	if (!gpio)
++		return -ENOMEM;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	gpio->regs = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(gpio->regs))
++		return PTR_ERR(gpio->regs);
++
++	if (!device_get_child_node_count(dev))
++		return -ENODEV;
++
++	device_for_each_child_node(dev, fwnode) {
++		int idx;
++
++		if (fwnode_property_read_u32(fwnode, "reg", &idx) ||
++		    idx >= MAX_NPORTS) {
++			dev_err(dev, "missing/invalid port index\n");
++			fwnode_handle_put(fwnode);
++			return -EINVAL;
++		}
++
++		if (fwnode_property_read_u32(fwnode, "ngpios", &gpio->ngpio[idx]) &&
++			fwnode_property_read_u32(fwnode, "nr-gpios", &gpio->ngpio[idx])) {
++			dev_info(dev,
++				 "failed to get number of gpios for Port%c\n",
++				 idx ? 'B' : 'A');
++			gpio->ngpio[idx] = NGPIO_DEFAULT;
++		}
++	}
++
++	/* irq_chip support */
++	gpio->irq_chip.name = dev_name(dev);
++	gpio->irq_chip.irq_ack = phytium_gpio_irq_ack;
++	gpio->irq_chip.irq_mask = phytium_gpio_irq_mask;
++	gpio->irq_chip.irq_unmask = phytium_gpio_irq_unmask;
++	gpio->irq_chip.irq_set_type = phytium_gpio_irq_set_type;
++	gpio->irq_chip.irq_enable = phytium_gpio_irq_enable;
++	gpio->irq_chip.irq_disable = phytium_gpio_irq_disable;
++#ifdef CONFIG_SMP
++	/* TODO: use irq_chip_set_affinity_parent instead? */
++	gpio->irq_chip.irq_set_affinity = phytium_gpio_irq_set_affinity;
++#endif
++	raw_spin_lock_init(&gpio->lock);
++
++	gpio->gc.base = -1;
++	gpio->gc.get_direction = phytium_gpio_get_direction;
++	gpio->gc.direction_input = phytium_gpio_direction_input;
++	gpio->gc.direction_output = phytium_gpio_direction_output;
++	gpio->gc.get = phytium_gpio_get;
++	gpio->gc.set = phytium_gpio_set;
++	gpio->gc.ngpio = gpio->ngpio[0] + gpio->ngpio[1];
++	gpio->gc.label = dev_name(dev);
++	gpio->gc.parent = dev;
++	gpio->gc.owner = THIS_MODULE;
++
++	girq = &gpio->gc.irq;
++	girq->handler = handle_bad_irq;
++	girq->default_type = IRQ_TYPE_NONE;
++
++	for (irq_count = 0; irq_count < platform_irq_count(pdev); irq_count++) {
++		gpio->irq[irq_count] = -ENXIO;
++		gpio->irq[irq_count] = platform_get_irq(pdev, irq_count);
++		if (gpio->irq[irq_count] < 0) {
++			//dev_warn(dev, "no irq is found.\n");
++			break;
++		}
++	};
++
++	girq->num_parents = irq_count;
++	girq->parents = gpio->irq;
++	girq->parent_handler = phytium_gpio_irq_handler;
++
++	girq->chip = &gpio->irq_chip;
++
++	err = devm_gpiochip_add_data(dev, &gpio->gc, gpio);
++	if (err)
++		return err;
++
++	platform_set_drvdata(pdev, gpio);
++	dev_info(dev, "Phytium GPIO controller @%pa registered\n",
++		&res->start);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int phytium_gpio_suspend(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct phytium_gpio *gpio = platform_get_drvdata(pdev);
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	gpio->ctx.swporta_dr = readl(gpio->regs + GPIO_SWPORTA_DR);
++	gpio->ctx.swporta_ddr = readl(gpio->regs + GPIO_SWPORTA_DDR);
++	gpio->ctx.ext_porta = readl(gpio->regs + GPIO_EXT_PORTA);
++	gpio->ctx.swportb_dr = readl(gpio->regs + GPIO_SWPORTB_DR);
++	gpio->ctx.swportb_ddr = readl(gpio->regs + GPIO_SWPORTB_DDR);
++	gpio->ctx.ext_portb = readl(gpio->regs + GPIO_EXT_PORTB);
++
++	gpio->ctx.inten = readl(gpio->regs + GPIO_INTEN);
++	gpio->ctx.intmask = readl(gpio->regs + GPIO_INTMASK);
++	gpio->ctx.inttype_level = readl(gpio->regs + GPIO_INTTYPE_LEVEL);
++	gpio->ctx.int_polarity = readl(gpio->regs + GPIO_INT_POLARITY);
++	gpio->ctx.debounce = readl(gpio->regs + GPIO_DEBOUNCE);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++
++	return 0;
++}
++
++static int phytium_gpio_resume(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct phytium_gpio *gpio = platform_get_drvdata(pdev);
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&gpio->lock, flags);
++
++	writel(gpio->ctx.swporta_dr, gpio->regs + GPIO_SWPORTA_DR);
++	writel(gpio->ctx.swporta_ddr, gpio->regs + GPIO_SWPORTA_DDR);
++	writel(gpio->ctx.ext_porta, gpio->regs + GPIO_EXT_PORTA);
++	writel(gpio->ctx.swportb_dr, gpio->regs + GPIO_SWPORTB_DR);
++	writel(gpio->ctx.swportb_ddr, gpio->regs + GPIO_SWPORTB_DDR);
++	writel(gpio->ctx.ext_portb, gpio->regs + GPIO_EXT_PORTB);
++
++	writel(gpio->ctx.inten, gpio->regs + GPIO_INTEN);
++	writel(gpio->ctx.intmask, gpio->regs + GPIO_INTMASK);
++	writel(gpio->ctx.inttype_level, gpio->regs + GPIO_INTTYPE_LEVEL);
++	writel(gpio->ctx.int_polarity, gpio->regs + GPIO_INT_POLARITY);
++	writel(gpio->ctx.debounce, gpio->regs + GPIO_DEBOUNCE);
++
++	writel(0xffffffff, gpio->regs + GPIO_PORTA_EOI);
++
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
++
++	return 0;
++}
++#endif
++
++static SIMPLE_DEV_PM_OPS(phytium_gpio_pm_ops, phytium_gpio_suspend,
++			 phytium_gpio_resume);
++
++static struct platform_driver phytium_gpio_driver = {
++	.driver		= {
++		.name	= "gpio-phytium-platform",
++		.pm	= &phytium_gpio_pm_ops,
++		.of_match_table = of_match_ptr(phytium_gpio_of_match),
++		.acpi_match_table = ACPI_PTR(phytium_gpio_acpi_match),
++	},
++	.probe		= phytium_gpio_probe,
++};
++
++module_platform_driver(phytium_gpio_driver);
++
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("Chen Baozi <chenbaozi@phytium.com.cn>");
++MODULE_DESCRIPTION("Phytium GPIO driver");
+diff --git a/drivers/gpio/gpio-phytium-sgpio.c b/drivers/gpio/gpio-phytium-sgpio.c
+new file mode 100755
+index 000000000..4785ca45f
+--- /dev/null
++++ b/drivers/gpio/gpio-phytium-sgpio.c
+@@ -0,0 +1,302 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Phytium SGPIO Driver
++ *
++ * Copyright (c) 2021-2024 Phytium Technology Co., Ltd.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/gpio/driver.h>
++#include <linux/hashtable.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/string.h>
++
++#define SGPIO_CTL0_REG			0x00
++#define  SGPIO_CTL0_REG_ENABLE		BIT(0)
++#define  SGPIO_CTL0_REG_RX_DISABLE	BIT(1)
++#define  SGPIO_CTL0_REG_L3_L0		GENMASK(11, 8)
++#define  SGPIO_CTL0_REG_CLK_DIV_NUM	GENMASK(31, 12)
++#define SGPIO_CTL1_REG			0x04
++#define  SGPIO_CTL1_REG_READY		BIT(0)
++#define  SGPIO_CTL1_REG_W_UPDATA	BIT(1)
++#define  SGPIO_CTL1_REG_OP_MODE		BIT(2)
++#define  SGPIO_CTL1_REG_OP_STATE	BIT(3)
++#define  SGPIO_CTL1_REG_BIT_NUM		GENMASK(14, 8)
++#define  SGPIO_CTL1_REG_INTERVAL_TIMER	GENMASK(31, 16)
++#define SGPIO_SOFT_RESET_REG		0x08
++#define  SGPIO_SOFT_RESET_REG_MASK	BIT(0)
++#define SGPIO_IRQ_REG			0x0c
++#define  SGPIO_IRQ_REG_MASK		BIT(0)
++#define SGPIO_IRQ_M_REG			0x10
++#define  SGPIO_IRQ_M_REG_MASK		BIT(0)
++#define SGPIO_WDATA0_REG		0x14
++#define SGPIO_WDATA_REG(x)		(SGPIO_WDATA0_REG + ((x) == 2 ? 3 : (x))* 4) // 0x14, 0x18, 0x20
++#define SGPIO_RDATA0_REG		0x24
++#define SGPIO_RDATA_REG(x)		(SGPIO_RDATA0_REG + (x) * 4)
++
++#define DEFAULT_L3_L0 0
++
++#define GPIO_GROUP(x)	((x) >> 6)
++#define GPIO_OFFSET(x)	((x) & GENMASK(5, 0))
++#define GPIO_BIT(x)	BIT(GPIO_OFFSET(x) >> 1)
++
++struct phytium_sgpio {
++	struct gpio_chip gc;
++	void __iomem *regs;
++	unsigned int ngpios;
++	struct clk *pclk;
++
++	struct mutex lock;
++	struct completion completion;
++};
++
++static bool phytium_sgpio_is_input(unsigned int offset)
++{
++	return !(offset % 2);
++}
++
++static int sgpio_set_value(struct gpio_chip *gc, unsigned int offset, int val)
++{
++	struct phytium_sgpio *gpio = gpiochip_get_data(gc);
++	u32 reg;
++	int rc = 0;
++
++	if (phytium_sgpio_is_input(offset))
++		return -EINVAL;
++
++	reinit_completion(&gpio->completion);
++
++	/*
++	 * Since this is an output, read the cached value from rdata,
++	 * then update value.
++	 */
++	/* cached data from wdata? */
++	reg = readl(gpio->regs + SGPIO_WDATA_REG(GPIO_GROUP(offset)));
++	if (val)
++		reg |= GPIO_BIT(offset);
++	else
++		reg &= GPIO_BIT(offset);
++	writel(reg, gpio->regs + SGPIO_WDATA_REG(GPIO_GROUP(offset)));
++
++	/* Start transmission and wait for completion */
++	writel(readl(gpio->regs + SGPIO_CTL1_REG) | SGPIO_CTL1_REG_W_UPDATA,
++	       gpio->regs + SGPIO_CTL1_REG);
++	if (!wait_for_completion_timeout(&gpio->completion, msecs_to_jiffies(1000)))
++		rc = -EINVAL;
++
++	return rc;
++}
++
++static int phytium_sgpio_direction_input(struct gpio_chip *gc, unsigned int offset)
++{
++	return phytium_sgpio_is_input(offset) ? 0 : -EINVAL;
++}
++
++static int phytium_sgpio_direction_output(struct gpio_chip *gc, unsigned int offset, int val)
++{
++	struct phytium_sgpio *gpio = gpiochip_get_data(gc);
++	int rc;
++
++	mutex_lock(&gpio->lock);
++
++	/*
++	 * No special action is required for setting the direction; we'll
++	 * error-out in sgpio_set_value if this isn't an output GPIO
++	 */
++	rc = sgpio_set_value(&gpio->gc, offset, val);
++
++	mutex_unlock(&gpio->lock);
++
++	return rc;
++}
++
++static int phytium_sgpio_get_direction(struct gpio_chip *gc, unsigned int offset)
++{
++	return !!phytium_sgpio_is_input(offset);
++}
++
++static int phytium_sgpio_get(struct gpio_chip *gc, unsigned int offset)
++{
++	struct phytium_sgpio *gpio = gpiochip_get_data(gc);
++	int rc = 0;
++	u32 val, ctl0;
++
++	mutex_lock(&gpio->lock);
++
++	if (!phytium_sgpio_is_input(offset)) {
++		val = readl(gpio->regs + SGPIO_WDATA_REG(GPIO_GROUP(offset)));
++		rc = !!(val & GPIO_BIT(offset));
++		mutex_unlock(&gpio->lock);
++		return rc;
++	}
++
++	reinit_completion(&gpio->completion);
++
++	/* Enable Rx */
++	ctl0 = readl(gpio->regs + SGPIO_CTL0_REG);
++	writel(ctl0 & ~SGPIO_CTL0_REG_RX_DISABLE, gpio->regs + SGPIO_CTL0_REG);
++
++	/* Start reading transaction and wait for completion */
++	writel(readl(gpio->regs + SGPIO_CTL1_REG) | SGPIO_CTL1_REG_W_UPDATA,
++	       gpio->regs + SGPIO_CTL1_REG);
++	if (!wait_for_completion_timeout(&gpio->completion, msecs_to_jiffies(1000))) {
++		rc = -EINVAL;
++		goto err;
++	}
++
++	val = readl(gpio->regs + SGPIO_RDATA_REG(GPIO_GROUP(offset)));
++	rc = !!(val & GPIO_BIT(offset));
++
++err:
++	/* Disalbe Rx to hold the value */
++	writel(ctl0 | SGPIO_CTL0_REG_RX_DISABLE, gpio->regs + SGPIO_CTL0_REG);
++	mutex_unlock(&gpio->lock);
++
++	return rc;
++}
++
++static void phytium_sgpio_set(struct gpio_chip *gc, unsigned int offset, int val)
++{
++	struct phytium_sgpio *gpio = gpiochip_get_data(gc);
++
++	mutex_lock(&gpio->lock);
++
++	sgpio_set_value(gc, offset, val);
++
++	mutex_unlock(&gpio->lock);
++}
++
++static irqreturn_t phytium_sgpio_irq_handler(int irq, void *data)
++{
++	struct phytium_sgpio *gpio = data;
++
++	if (!readl(gpio->regs + SGPIO_IRQ_REG))
++		return IRQ_NONE;
++
++	/* Clear the interrupt */
++	writel(0, gpio->regs + SGPIO_IRQ_REG);
++
++	/* Check if tx/rx has been done */
++	if (!(readl(gpio->regs + SGPIO_CTL1_REG) & SGPIO_CTL1_REG_OP_STATE))
++		complete(&gpio->completion);
++
++	return IRQ_HANDLED;
++}
++
++static int phytium_sgpio_probe(struct platform_device *pdev)
++{
++	u32 pclk_freq, sclk_freq, clk_div;
++	struct phytium_sgpio *gpio;
++	struct resource *res;
++	struct device *dev = &pdev->dev;
++	int rc;
++
++	gpio = devm_kzalloc(dev, sizeof(*gpio), GFP_KERNEL);
++	if (!gpio)
++		return -ENOMEM;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	gpio->regs = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(gpio->regs))
++		return PTR_ERR(gpio->regs);
++
++	if (devm_request_irq(dev, platform_get_irq(pdev, 0),
++			     phytium_sgpio_irq_handler,
++			     IRQF_SHARED, dev_name(dev), gpio)) {
++		dev_err(dev, "failed to request IRQ\n");
++		return -ENOENT;
++	}
++
++	rc = fwnode_property_read_u32(dev_fwnode(dev), "ngpios", &gpio->ngpios);
++	if (rc < 0) {
++		dev_err(dev, "Could not read ngpios property\n");
++		return -EINVAL;
++	} else if (gpio->ngpios % 32) {
++		dev_err(&pdev->dev, "Number of GPIOs not multiple of 32: %d\n",
++			gpio->ngpios);
++		return -EINVAL;
++	}
++
++	rc = fwnode_property_read_u32(dev_fwnode(dev), "bus-frequency", &sclk_freq);
++	if (rc < 0) {
++		dev_err(dev, "Could not read bus-frequency property\n");
++		return -EINVAL;
++	}
++
++	gpio->pclk = devm_clk_get(dev, NULL);
++	if (IS_ERR(gpio->pclk)) {
++		dev_err(dev, "Could not get the APB clock property\n");
++		return PTR_ERR(gpio->pclk);
++	}
++	rc = clk_prepare_enable(gpio->pclk);
++	if (rc) {
++		dev_err(dev, "failed to enable pclk: %d\n", rc);
++		return rc;
++	}
++	pclk_freq = clk_get_rate(gpio->pclk);
++
++	/*
++	 * From the datasheet:
++	 *   (pclk / 2) / (clk_div + 1) = sclk
++	 */
++	if (sclk_freq == 0) {
++		dev_err(dev, "SCLK should not be 0\n");
++		return -EINVAL;
++	}
++
++	clk_div = (pclk_freq / (sclk_freq * 2)) - 1;
++	if (clk_div > (1 << 20) - 1) {
++		dev_err(dev, "clk_div is overflow\n");
++		return -EINVAL;
++	}
++
++	writel(FIELD_PREP(SGPIO_CTL0_REG_CLK_DIV_NUM, clk_div) |
++	       FIELD_PREP(SGPIO_CTL0_REG_L3_L0, DEFAULT_L3_L0) |
++	       SGPIO_CTL0_REG_RX_DISABLE | SGPIO_CTL0_REG_ENABLE,
++	       gpio->regs + SGPIO_CTL0_REG);
++
++	writel(FIELD_PREP(SGPIO_CTL1_REG_BIT_NUM, gpio->ngpios) |
++	       SGPIO_CTL1_REG_READY, gpio->regs + SGPIO_CTL1_REG);
++
++	mutex_init(&gpio->lock);
++	init_completion(&gpio->completion);
++	platform_set_drvdata(pdev, gpio);
++
++	gpio->gc.parent = dev;
++	gpio->gc.base = -1;
++	gpio->gc.ngpio = gpio->ngpios * 2;
++	gpio->gc.label = dev_name(dev);
++	gpio->gc.direction_input = phytium_sgpio_direction_input;
++	gpio->gc.direction_output = phytium_sgpio_direction_output;
++	gpio->gc.get_direction = phytium_sgpio_get_direction;
++	gpio->gc.get = phytium_sgpio_get;
++	gpio->gc.set = phytium_sgpio_set;
++
++	return devm_gpiochip_add_data(dev, &gpio->gc, gpio);
++}
++
++static const struct of_device_id phytium_sgpio_of_match[] = {
++	{ .compatible = "phytium,sgpio", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, phytium_sgpio_of_match);
++
++static struct platform_driver phytium_sgpio_driver = {
++	.driver = {
++		.name = KBUILD_MODNAME,
++		.of_match_table = of_match_ptr(phytium_sgpio_of_match),
++	},
++	.probe = phytium_sgpio_probe,
++};
++module_platform_driver(phytium_sgpio_driver);
++
++MODULE_AUTHOR("Chen Baozi <chenbaozi@phytium.com.cn>");
++MODULE_DESCRIPTION("Phytium SGPIO driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/net/can/Kconfig b/drivers/net/can/Kconfig
+old mode 100644
+new mode 100755
+index 1c28eade6..09bf99e20
+--- a/drivers/net/can/Kconfig
++++ b/drivers/net/can/Kconfig
+@@ -179,6 +179,8 @@ source "drivers/net/can/softing/Kconfig"
+ source "drivers/net/can/spi/Kconfig"
+ source "drivers/net/can/usb/Kconfig"
+ 
++source "drivers/net/can/phytium/Kconfig"
++
+ endif
+ 
+ config CAN_DEBUG_DEVICES
+diff --git a/drivers/net/can/Makefile b/drivers/net/can/Makefile
+old mode 100644
+new mode 100755
+index a2b4463d8..18f31d6ca
+--- a/drivers/net/can/Makefile
++++ b/drivers/net/can/Makefile
+@@ -29,5 +29,6 @@ obj-$(CONFIG_CAN_SUN4I)		+= sun4i_can.o
+ obj-$(CONFIG_CAN_TI_HECC)	+= ti_hecc.o
+ obj-$(CONFIG_CAN_XILINXCAN)	+= xilinx_can.o
+ obj-$(CONFIG_PCH_CAN)		+= pch_can.o
++obj-$(CONFIG_CAN_PHYTIUM)	+= phytium/
+ 
+ subdir-ccflags-$(CONFIG_CAN_DEBUG_DEVICES) += -DDEBUG
+diff --git a/drivers/net/can/phytium/Kconfig b/drivers/net/can/phytium/Kconfig
+new file mode 100755
+index 000000000..a23216d23
+--- /dev/null
++++ b/drivers/net/can/phytium/Kconfig
+@@ -0,0 +1,34 @@
++# SPDX-License-Identifier: GPL-2.0-only
++menuconfig CAN_PHYTIUM
++	tristate "Phytium CAN support"
++	help
++	  Say Y here if you want support for Phytium CAN controller framework.
++	  This is common support for devices that embed the Phytium CAN IP.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called phytium_can.
++
++if CAN_PHYTIUM
++
++config CAN_PHYTIUM_PLATFORM
++	tristate "Phytium CAN support for io-mapped devices"
++	depends on HAS_IOMEM
++	help
++	  Say Y here is you want to support for IO Mapped Phytium CAN controller.
++	  This support is for devices that have the Phytium CAN controller IP
++	  embedded into the device and the IP is IO Mapped to the processor.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called phytium_can_platform.
++
++config CAN_PHYTIUM_PCI
++	tristate "Phytium CAN support for PCI devices"
++	depends on PCI
++	help
++	  Say Y here is you want to support for Phytium CAN controller connected
++	  to the PCI bus. This support is for devices that have the Phytium CAN
++	  controller IP embedded into a PCI device.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called phytium_can_pci.
++endif
+diff --git a/drivers/net/can/phytium/Makefile b/drivers/net/can/phytium/Makefile
+new file mode 100755
+index 000000000..7ef554fca
+--- /dev/null
++++ b/drivers/net/can/phytium/Makefile
+@@ -0,0 +1,8 @@
++#
++# Makefile for the Phytium CAN controller drivers.
++#
++#
++
++obj-$(CONFIG_CAN_PHYTIUM) += phytium_can.o
++obj-$(CONFIG_CAN_PHYTIUM_PLATFORM) += phytium_can_platform.o
++obj-$(CONFIG_CAN_PHYTIUM_PCI) += phytium_can_pci.o
+diff --git a/drivers/net/can/phytium/phytium_can.c b/drivers/net/can/phytium/phytium_can.c
+new file mode 100755
+index 000000000..1b2859ac1
+--- /dev/null
++++ b/drivers/net/can/phytium/phytium_can.c
+@@ -0,0 +1,1199 @@
++// SPDX-License-Identifier: GPL-2.0
++/* CAN bus driver for Phytium CAN controller
++ *
++ * Copyright (c) 2021-2024 Phytium Technology Co., Ltd.
++ */
++
++#include <linux/bitfield.h>
++
++#include "phytium_can.h"
++
++/* register definition */
++enum phytium_can_reg {
++	CAN_CTRL		= 0x00,		/* Global control register */
++	CAN_INTR		= 0x04,		/* Interrupt register */
++	CAN_ARB_RATE_CTRL	= 0x08,		/* Arbitration rate control register */
++	CAN_DAT_RATE_CTRL	= 0x0c,		/* Data rate control register */
++	CAN_ACC_ID0		= 0x10,		/* Acceptance identifier0 register */
++	CAN_ACC_ID1		= 0x14,		/* Acceptance identifier1 register */
++	CAN_ACC_ID2		= 0x18,		/* Acceptance identifier2 register */
++	CAN_ACC_ID3		= 0x1c,		/* Acceptance identifier3 register */
++	CAN_ACC_ID0_MASK	= 0x20,		/* Acceptance identifier0 mask register */
++	CAN_ACC_ID1_MASK	= 0x24,		/* Acceptance identifier1 mask register */
++	CAN_ACC_ID2_MASK	= 0x28,		/* Acceptance identifier2 mask register */
++	CAN_ACC_ID3_MASK	= 0x2c,		/* Acceptance identifier3 mask register */
++	CAN_XFER_STS		= 0x30,		/* Transfer status register */
++	CAN_ERR_CNT		= 0x34,		/* Error counter register */
++	CAN_FIFO_CNT		= 0x38,		/* FIFO counter register */
++	CAN_DMA_CTRL		= 0x3c,		/* DMA request control register */
++	CAN_XFER_EN		= 0x40,		/* Transfer enable register */
++	CAN_INTR1		= 0x44,		/* Interrupt register 1 */
++	CAN_FRM_INFO		= 0x48,		/* Frame valid number register */
++	CAN_TIME_OUT		= 0x4c,		/* Timeout register */
++	CAN_TIME_OUT_CNT	= 0x50,		/* Timeout counter register */
++	CAN_INTR2		= 0x54,		/* Interrupt register 2 */
++	CAN_TX_FIFO		= 0x100,	/* TX FIFO shadow register */
++	CAN_RX_FIFO		= 0x200,	/* RX FIFO shadow register */
++	CAN_RX_INFO_FIFO	= 0x300,	/* RX information FIFO shadow register */
++	CAN_PIDR4		= 0xfd0,	/* Peripheral Identification Register 4 */
++	CAN_PIDR0		= 0xfe0,	/* Peripheral Identification Register 0 */
++	CAN_PIDR1		= 0xfe4,	/* Peripheral Identification Register 1 */
++	CAN_PIDR2		= 0xfe8,	/* Peripheral Identification Register 2 */
++	CAN_PIDR3		= 0xfec,	/* Peripheral Identification Register 3 */
++	CAN_CIDR0		= 0xff0,	/* Component Identification Register 0 */
++	CAN_CIDR1		= 0xff4,	/* Component Identification Register 1 */
++	CAN_CIDR2		= 0xff8,	/* Component Identification Register 2 */
++	CAN_CIDR3		= 0xffc,	/* Component Identification Register 3 */
++};
++
++/* Global control register (CTRL) */
++#define CTRL_XFER		BIT(0)	/* Transfer enable */
++#define CTRL_TXREQ		BIT(1)	/* Transmit request */
++#define CTRL_AIME		BIT(2)	/* Acceptance identifier mask enable */
++#define CTRL_TTS		BIT(3)	/* Transmit trigger strategy */
++#define CTRL_RST		BIT(7)	/* Write 1 to soft reset and self clear */
++#define CTRL_RFEIDF		BIT(8)	/* Allow RX frame end interrupt during ID filtered frame */
++#define CTRL_RFEDT		BIT(9)	/* Allow RX frame end interrupt during TX frame */
++#define CTRL_IOF		BIT(10)	/* Ignore overload flag internally */
++#define CTRL_FDCRC		BIT(11)	/* CANFD CRC mode */
++
++/* Interrupt register (INTR) */
++#define INTR_BOIS	BIT(0)  /* Bus off interrupt status */
++#define INTR_PWIS	BIT(1)  /* Passive warning interrupt status */
++#define INTR_PEIS	BIT(2)  /* Passive error interrupt status */
++#define INTR_RFIS	BIT(3)  /* RX FIFO full interrupt status */
++#define INTR_TFIS	BIT(4)  /* TX FIFO empty interrupt status */
++#define INTR_REIS	BIT(5)  /* RX frame end interrupt status */
++#define INTR_TEIS	BIT(6)  /* TX frame end interrupt status */
++#define INTR_EIS	BIT(7)  /* Error interrupt status */
++#define INTR_BOIE	BIT(8)  /* Bus off interrupt enable */
++#define INTR_PWIE	BIT(9)  /* Passive warning interrupt enable */
++#define INTR_PEIE	BIT(10) /* Passive error interrupt enable */
++#define INTR_RFIE	BIT(11) /* RX FIFO full interrupt enable */
++#define INTR_TFIE	BIT(12) /* TX FIFO empty interrupt enable */
++#define INTR_REIE	BIT(13) /* RX frame end interrupt enable */
++#define INTR_TEIE	BIT(14) /* TX frame end interrupt enable */
++#define INTR_EIE	BIT(15) /* Error interrupt enable */
++#define INTR_BOIC	BIT(16) /* Bus off interrupt clear */
++#define INTR_PWIC	BIT(17) /* Passive warning interrupt clear */
++#define INTR_PEIC	BIT(18) /* Passive error interrupt clear */
++#define INTR_RFIC	BIT(19) /* RX FIFO full interrupt clear */
++#define INTR_TFIC	BIT(20) /* TX FIFO empty interrupt clear */
++#define INTR_REIC	BIT(21) /* RX frame end interrupt clear */
++#define INTR_TEIC	BIT(22) /* TX frame end interrupt clear */
++#define INTR_EIC	BIT(23) /* Error interrupt clear */
++
++#define INTR_STATUS_MASK (INTR_BOIS | INTR_PWIS | INTR_PEIS | INTR_RFIS | \
++			  INTR_TFIS | INTR_REIS | INTR_TEIS | INTR_EIS)
++
++#define INTR_EN_MASK    (INTR_BOIE | INTR_PWIE | INTR_PEIE | INTR_RFIE | \
++			 INTR_REIE | INTR_TEIE | INTR_EIE)
++
++#define INTR_CLEAR_MASK	 (INTR_BOIC | INTR_PWIC | INTR_PEIC | INTR_RFIC | \
++			  INTR_TFIC | INTR_REIC | INTR_TEIC | INTR_EIC)
++
++/* Arbitration rate control register (ARB_RATE_CTRL) */
++#define ARB_RATE_CTRL_ARJW	GENMASK(1, 0)	/* Arbitration field resync jump width */
++#define ARB_RATE_CTRL_APRS	GENMASK(4, 2)	/* Arbitration field propagation segment */
++#define ARB_RATE_CTRL_APH1S	GENMASK(7, 5)	/* Arbitration field phase1 segment */
++#define ARB_RATE_CTRL_APH2S	GENMASK(10, 8)	/* Arbitration field phase2 segment */
++#define ARB_RATE_CTRL_APD	GENMASK(28, 16)	/* Arbitration field prescaler divider */
++
++/* Data rate control register (DAT_RATE_CTRL) */
++#define DAT_RATE_CTRL_DRJW	GENMASK(1, 0)	/* Data field resync jump width */
++#define DAT_RATE_CTRL_DPRS	GENMASK(4, 2)	/* Data field propagation segment */
++#define DAT_RATE_CTRL_DPH1S	GENMASK(7, 5)	/* Data field phase1 segment */
++#define DAT_RATE_CTRL_DPH2S	GENMASK(10, 8)	/* Data field phase2 segment */
++#define DAT_RATE_CTRL_DPD	GENMASK(28, 16)	/* Data field prescaler divider */
++
++/* Acceptance identifierX register (ACC_IDX) */
++#define ACC_IDX_AID_MASK	GENMASK(28, 0)	/* Acceptance identifier */
++
++/* Acceptance identifier0 mask register (ACC_ID0_MASK) */
++#define ACC_IDX_MASK_AID_MASK	GENMASK(28, 0)	/* Acceptance identifier mask */
++
++/* Transfer status register (XFER_STS) */
++#define XFER_STS_FRAS		GENMASK(2, 0)	/* Frame status */
++#define XFER_STS_FIES		GENMASK(7, 3)	/* Field status */
++#define  XFER_STS_FIES_IDLE		(0x0)	/* idle */
++#define  XFER_STS_FIES_ARBITRATION	(0x1)	/* arbitration */
++#define  XFER_STS_FIES_TX_CTRL		(0x2)	/* transmit control */
++#define  XFER_STS_FIES_TX_DATA		(0x3)	/* transmit data */
++#define  XFER_STS_FIES_TX_CRC		(0x4)	/* transmit crc */
++#define  XFER_STS_FIES_TX_FRM		(0x5)	/* transmit frame */
++#define  XFER_STS_FIES_RX_CTRL		(0x6)	/* receive control */
++#define  XFER_STS_FIES_RX_DATA		(0x7)	/* receive data */
++#define  XFER_STS_FIES_RX_CRC		(0x8)	/* receive crc */
++#define  XFER_STS_FIES_RX_FRM		(0x9)	/* receive frame */
++#define  XFER_STS_FIES_INTERMISSION	(0xa)	/* intermission */
++#define  XFER_STS_FIES_TX_SUSPD		(0xb)	/* transmit suspend */
++#define  XFER_STS_FIES_BUS_IDLE		(0xc)	/* bus idle */
++#define  XFER_STS_FIES_OVL_FLAG		(0xd)	/* overload flag */
++#define  XFER_STS_FIES_OVL_DLM		(0xe)	/* overload delimiter */
++#define  XFER_STS_FIES_ERR_FLAG		(0xf)	/* error flag */
++#define  XFER_STS_FIES_ERR_DLM		(0x10)	/* error delimiter */
++#define  XFER_STS_FIES_BUS_OFF		(0x11)	/* bus off */
++#define XFER_STS_TS			BIT(8)	/* Transmit status */
++#define XFER_STS_RS			BIT(9)	/* Receive status */
++#define XFER_STS_XFERS			BIT(10)	/* Transfer status */
++
++/* Error counter register (ERR_CNT) */
++#define ERR_CNT_REC		GENMASK(8, 0)	/* Receive error counter */
++#define ERR_CNT_TEC		GENMASK(24, 16)	/* Transmit error counter */
++
++/* FIFO counter register (FIFO_CNT) */
++#define FIFO_CNT_RFN		GENMASK(6, 0)	/* Receive FIFO valid data number */
++#define FIFO_CNT_TFN		GENMASK(22, 16)	/* Transmit FIFO valid data number */
++
++/* DMA request control register (DMA_CTRL) */
++#define DMA_CTRL_RFTH		GENMASK(5, 0)	/* Receive FIFO DMA request threshold */
++#define DMA_CTRL_RFRE		BIT(6)		/* Receive FIFO DMA request enable */
++#define DMA_CTRL_TFTH		GENMASK(21, 16)	/* Transmit FIFO DMA request threshold */
++#define DMA_CTRL_TFRE		BIT(22)		/* Transmit FIFO DMA request enable */
++
++/* Transfer enable register (XFER_EN) */
++#define XFER_EN_XFER		BIT(0)		/* Transfer enable */
++
++/* Interrupt register 1 (INTR1) */
++#define INTR1_RF1IS	BIT(0)	/* RX FIFO 1/4 interrupt status */
++#define INTR1_RF2IS	BIT(1)	/* RX FIFO 1/2 interrupt status */
++#define INTR1_RF3IS	BIT(2)	/* RX FIFO 3/4 interrupt status */
++#define INTR1_RF4IS	BIT(3)	/* RX FIFO full interrupt status */
++#define INTR1_TF1IS	BIT(4)	/* TX FIFO 1/4 interrupt status */
++#define INTR1_TF2IS	BIT(5)	/* TX FIFO 1/2 interrupt status */
++#define INTR1_TF3IS	BIT(6)	/* TX FIFO 3/4 interrupt status */
++#define INTR1_TF4IS	BIT(7)	/* TX FIFO empty interrupt status */
++#define INTR1_RF1IE	BIT(8)	/* RX FIFO 1/4 interrupt enable */
++#define INTR1_RF2IE	BIT(9)	/* RX FIFO 1/2 interrupt enable */
++#define INTR1_RF3IE	BIT(10)	/* RX FIFO 3/4 interrupt enable */
++#define INTR1_RF4IE	BIT(11)	/* RX FIFO full interrupt enable */
++#define INTR1_TF1IE	BIT(12)	/* TX FIFO 1/4 interrupt enable */
++#define INTR1_TF2IE	BIT(13)	/* TX FIFO 1/2 interrupt enable */
++#define INTR1_TF3IE	BIT(14)	/* TX FIFO 3/4 interrupt enable */
++#define INTR1_TF4IE	BIT(15)	/* TX FIFO empty interrupt enable */
++#define INTR1_RF1IC	BIT(16)	/* RX FIFO 1/4 interrupt clear */
++#define INTR1_RF2IC	BIT(17)	/* RX FIFO 1/2 interrupt clear */
++#define INTR1_RF3IC	BIT(18)	/* RX FIFO 3/4 interrupt clear */
++#define INTR1_RF4IC	BIT(19)	/* RX FIFO full interrupt clear */
++#define INTR1_TF1IC	BIT(20)	/* TX FIFO 1/4 interrupt clear */
++#define INTR1_TF2IC	BIT(21)	/* TX FIFO 1/2 interrupt clear */
++#define INTR1_TF3IC	BIT(22)	/* TX FIFO 3/4 interrupt clear */
++#define INTR1_TF4IC	BIT(23)	/* TX FIFO empty interrupt clear */
++#define INTR1_RF1RIS	BIT(24)	/* RX FIFO 1/4 raw interrupt status */
++#define INTR1_RF2RIS	BIT(25)	/* RX FIFO 1/2 raw interrupt status */
++#define INTR1_RF3RIS	BIT(26)	/* RX FIFO 3/4 raw interrupt status */
++#define INTR1_RF4RIS	BIT(27)	/* RX FIFO full raw interrupt status */
++#define INTR1_TF1RIS	BIT(28)	/* TX FIFO 1/4 raw interrupt status */
++#define INTR1_TF2RIS	BIT(29)	/* TX FIFO 1/2 raw interrupt status */
++#define INTR1_TF3RIS	BIT(30)	/* TX FIFO 3/4 raw interrupt status */
++#define INTR1_TF4RIS	BIT(31)	/* TX FIFO empty raw interrupt status */
++
++/* Frame valid number register (FRM_INFO) */
++#define FRM_INFO_RXFC	GENMASK(5, 0)	/* Valid frame number in RX FIFO */
++#define FRM_INFO_SSPD	GENMASK(31, 16)	/* Secondary sample point delay */
++
++/* Interrupt register 2 (INTR2) */
++#define INTR2_TOIS	BIT(0)	/* RX FIFO time out interrupt status */
++#define INTR2_TOIM	BIT(8)	/* RX FIFO time out interrupt mask */
++#define INTR2_TOIC	BIT(16)	/* RX FIFO time out interrupt clear */
++#define INTR2_TORIS	BIT(24)	/* RX FIFO time out raw interrupt status */
++
++/* RX information FIFO shadow register (RX_INFO_FIFO) */
++#define RX_INFO_FIFO_WNORF	GENMASK(4, 0)	/* Word (4-byte) number of current receive frame */
++#define RX_INFO_FIFO_RORF	BIT(5)		/* RTR value of current receive frame */
++#define RX_INFO_FIFO_FORF	BIT(6)		/* FDF value of current receive frame */
++#define RX_INFO_FIFO_IORF	BIT(7)		/* IDE value of current receive frame */
++
++/* Arbitration Bits */
++#define CAN_ID1_MASK		GENMASK(31, 21)	/* Base identifer */
++/* Standard Remote Transmission Request */
++#define CAN_ID1_RTR_MASK	BIT(20)
++/* Extended Substitute remote TXreq */
++#define	CAN_ID2_SRR_MASK	BIT(20)
++#define CAN_IDE_MASK		BIT(19)		/* IDentifier extension flag */
++#define CAN_ID2_MASK		GENMASK(18, 1)	/* Identifier extension */
++/* Extended frames remote TX request */
++#define CAN_ID2_RTR_MASK	BIT(0)
++#define CAN_ID1_FDF_MASK	BIT(18)
++#define CAN_ID1_DLC_MASK	GENMASK(17, 14)
++#define CANFD_ID1_BRS_MASK	BIT(16)
++#define CANFD_ID1_ESI_MASK	BIT(15)
++#define CANFD_ID1_DLC_MASK	GENMASK(14, 11)
++
++#define CAN_ID2_FDF_MASK	BIT(31)
++#define CAN_ID2_DLC_MASK	GENMASK(29, 26)
++#define CANFD_ID2_BRS_MASK	BIT(29)
++#define CANFD_ID2_ESI_MASK	BIT(28)
++#define CANFD_ID2_DLC_MASK	GENMASK(27, 24)
++
++#define CAN_ID1_DLC_OFF		14
++#define CANFD_ID1_DLC_OFF	11
++#define CAN_ID2_DLC_OFF		26
++#define CANFD_ID2_DLC_OFF	24
++
++#define CAN_IDR_ID1_SHIFT       21  /* Standard Messg Identifier */
++#define CAN_IDR_ID2_SHIFT       1   /* Extended Message Identifier */
++#define CAN_IDR_SDLC_SHIFT      14
++#define CAN_IDR_EDLC_SHIFT      26
++
++/* CANFD Standard msg padding 1 */
++#define CANFD_IDR_PAD_MASK	0x000007FF
++#define CAN_IDR_PAD_MASK	0x00003FFF	/* Standard msg padding 1 */
++
++/**
++ * phytium_can_set_reg_bits - set a bit value to the device register
++ * @cdev:	Driver private data structure
++ * @reg:	Register offset
++ * @bs:     The bit mask
++ *
++ * Read data from the particular CAN register
++ * Return: value read from the CAN register
++ */
++static void
++phytium_can_set_reg_bits(const struct phytium_can_dev *cdev,
++			 enum phytium_can_reg reg, u32 bs)
++{
++	u32 val = readl(cdev->base + reg);
++
++	val |= bs;
++	writel(val, cdev->base + reg);
++}
++
++/**
++ * phytium_can_clr_reg_bits - clear a bit value to the device register
++ * @cdev:	Driver private data structure
++ * @reg:	Register offset
++ * @bs:     The bit mask
++ *
++ * Read data from the particular CAN register
++ * Return: value read from the CAN register
++ */
++static void
++phytium_can_clr_reg_bits(const struct phytium_can_dev *cdev,
++			 enum phytium_can_reg reg, u32 bs)
++{
++	u32 val = readl(cdev->base + reg);
++
++	val &= ~bs;
++	writel(val, cdev->base + reg);
++}
++
++static inline u32 phytium_can_read(const struct phytium_can_dev *cdev, enum phytium_can_reg reg)
++{
++	return readl(cdev->base + reg);
++}
++
++static inline void phytium_can_write(const struct phytium_can_dev *cdev, enum phytium_can_reg reg,
++				     u32 val)
++{
++	writel(val, cdev->base + reg);
++}
++
++static inline void phytium_can_enable_all_interrupts(struct phytium_can_dev *cdev)
++{
++	phytium_can_write(cdev, CAN_INTR, INTR_EN_MASK);
++}
++
++static inline void phytium_can_disable_all_interrupt(struct phytium_can_dev *cdev)
++{
++	phytium_can_write(cdev, CAN_INTR, 0x0);
++}
++
++static int phytium_can_get_berr_counter(const struct net_device *dev,
++					struct can_berr_counter *bec)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++
++	bec->rxerr = phytium_can_read(cdev, CAN_ERR_CNT) & ERR_CNT_REC;
++	bec->txerr = (phytium_can_read(cdev, CAN_ERR_CNT) & ERR_CNT_TEC) >> 16;
++
++	return 0;
++}
++
++static int phytium_can_read_fifo(struct net_device *dev)
++{
++	struct net_device_stats *stats = &dev->stats;
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++	struct canfd_frame *cf;
++	struct sk_buff *skb;
++	u32 id, dlc, i;
++
++	/* Read the frame header from FIFO */
++	id = phytium_can_read(cdev, CAN_RX_FIFO);
++	id = be32_to_cpup(&id);
++	if (id & CAN_IDE_MASK) {
++		/* Received an extended frame */
++		dlc = phytium_can_read(cdev, CAN_RX_FIFO);
++		dlc = be32_to_cpup(&dlc);
++		if (dlc & CAN_ID2_FDF_MASK)
++			skb = alloc_canfd_skb(dev, &cf);
++		else
++			skb = alloc_can_skb(dev, (struct can_frame **)&cf);
++
++		if (unlikely(!skb)) {
++			stats->rx_dropped++;
++			return 0;
++		}
++
++		if (dlc & CAN_ID2_FDF_MASK) {
++			/* CAN FD extended frame */
++			if (dlc & CANFD_ID2_BRS_MASK)
++				cf->flags |= CANFD_BRS;
++			if (dlc & CANFD_ID2_ESI_MASK)
++				cf->flags |= CANFD_ESI;
++			cf->len = can_dlc2len((dlc & CANFD_ID2_DLC_MASK) >> CANFD_ID2_DLC_OFF);
++		} else {
++			/* CAN extended frame */
++			cf->len = get_can_dlc((dlc & CAN_ID2_DLC_MASK) >> CAN_ID2_DLC_OFF);
++		}
++
++		cf->can_id = (id & CAN_ID1_MASK) >> 3;
++		cf->can_id |= (id & CAN_ID2_MASK) >> 1;
++		cf->can_id |= CAN_EFF_FLAG;
++
++		if (id & CAN_ID2_RTR_MASK)
++			cf->can_id |= CAN_RTR_FLAG;
++	} else {
++		/* Received a standard frame */
++		if (id & CAN_ID1_FDF_MASK)
++			skb = alloc_canfd_skb(dev, &cf);
++		else
++			skb = alloc_can_skb(dev, (struct can_frame **)&cf);
++
++		if (unlikely(!skb)) {
++			stats->rx_dropped++;
++			return 0;
++		}
++
++		if (id & CAN_ID1_FDF_MASK) {
++			/* CAN FD extended frame */
++			if (id & CANFD_ID1_BRS_MASK)
++				cf->flags |= CANFD_BRS;
++			if (id & CANFD_ID1_ESI_MASK)
++				cf->flags |= CANFD_ESI;
++			cf->len = can_dlc2len((id & CANFD_ID1_DLC_MASK) >> CANFD_ID1_DLC_OFF);
++		} else {
++			/* CAN extended frame */
++			cf->len = get_can_dlc((id & CAN_ID1_DLC_MASK) >> CAN_ID1_DLC_OFF);
++		}
++
++		cf->can_id = (id & CAN_ID1_MASK) >> 21;
++
++		if (id & CAN_ID1_RTR_MASK)
++			cf->can_id |= CAN_RTR_FLAG;
++	}
++
++	if (!(cf->can_id & CAN_RTR_FLAG))
++		/* Receive data frames */
++		for (i = 0; i < cf->len; i += 4)
++			*(__be32 *)(cf->data + i) = phytium_can_read(cdev, CAN_RX_FIFO);
++
++	stats->rx_packets++;
++	stats->rx_bytes += cf->len;
++	netif_receive_skb(skb);
++
++	return 1;
++}
++
++static int phytium_can_do_rx_poll(struct net_device *dev, int quota)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++	u32 rxfs, pkts = 0;
++
++	rxfs = phytium_can_read(cdev, CAN_FIFO_CNT) & FIFO_CNT_RFN;
++	if (!rxfs) {
++		netdev_dbg(dev, "no messages in RX FIFO\n");
++		return 0;
++	}
++
++	while ((rxfs != 0) && (quota > 0)) {
++		pkts += phytium_can_read_fifo(dev);
++		quota--;
++		rxfs = phytium_can_read(cdev, CAN_FIFO_CNT) & FIFO_CNT_RFN;
++		netdev_dbg(dev, "Next received %d frame again.\n", rxfs);
++	}
++
++	if (pkts)
++		can_led_event(dev, CAN_LED_EVENT_RX);
++
++	return pkts;
++}
++
++static int phytium_can_poll(struct napi_struct *napi, int quota)
++{
++	struct net_device *dev = napi->dev;
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++	int work_done;
++	unsigned long flags;
++
++	netdev_dbg(dev, "The receive processing is going on !\n");
++
++	work_done = phytium_can_do_rx_poll(dev, quota);
++
++	/* Don't re-enable interrupts if the driver had a fatal error
++	 * (e.g., FIFO read failure)
++	 */
++	if (work_done >= 0 && work_done < quota) {
++		napi_complete_done(napi, work_done);
++
++		spin_lock_irqsave(&cdev->lock, flags);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_REIE);
++		spin_unlock_irqrestore(&cdev->lock, flags);
++	}
++
++	return work_done;
++}
++
++static void phytium_can_write_frame(struct phytium_can_dev *cdev)
++{
++	struct canfd_frame *cf = (struct canfd_frame *)cdev->tx_skb->data;
++	struct net_device *dev = cdev->net;
++	struct net_device_stats *stats = &dev->stats;
++	struct sk_buff *skb = cdev->tx_skb;
++	u32 i, id, dlc = 0, frame_head[2] = {0, 0};
++	u32 data_len;
++
++	data_len = can_len2dlc(cf->len);
++	cdev->tx_skb = NULL;
++
++	/* Watch carefully on the bit sequence */
++	if (cf->can_id & CAN_EFF_FLAG) {
++		/* Extended CAN ID format */
++		id = ((cf->can_id & CAN_EFF_MASK) << 1) & CAN_ID2_MASK;
++		id |= (((cf->can_id & CAN_EFF_MASK) >>
++			(CAN_EFF_ID_BITS - CAN_SFF_ID_BITS)) <<
++			CAN_IDR_ID1_SHIFT) & CAN_ID1_MASK;
++
++		/* The substibute remote TX request bit should be "1"
++		 * for extended frames as in the Phytium CAN datasheet
++		 */
++		id |= CAN_IDE_MASK | CAN_ID2_SRR_MASK;
++
++		if (cf->can_id & CAN_RTR_FLAG)
++			/* Extended frames remote TX request */
++			id |= CAN_ID2_RTR_MASK;
++		if ((cdev->can.ctrlmode & CAN_CTRLMODE_FD) &&
++		    can_is_canfd_skb(skb))
++			dlc = data_len << CANFD_ID2_DLC_OFF;
++		else
++			dlc = data_len << CAN_ID2_DLC_OFF;
++
++		if (cdev->can.ctrlmode & CAN_CTRLMODE_FD) {
++			dlc |= CAN_ID2_FDF_MASK;
++			if (cf->flags & CANFD_BRS)
++				dlc |= CANFD_ID2_BRS_MASK;
++			if (cf->flags & CANFD_ESI)
++				dlc |= CANFD_ID2_ESI_MASK;
++		}
++
++		frame_head[0] = cpu_to_be32p(&id);
++		frame_head[1] = cpu_to_be32p(&dlc);
++
++		/* Write the Frame to Phytium CAN TX FIFO */
++		phytium_can_write(cdev, CAN_TX_FIFO, frame_head[0]);
++		phytium_can_write(cdev, CAN_TX_FIFO, frame_head[1]);
++		netdev_dbg(dev, "Write atbitration field [0]:0x%x [1]:0x%x\n",
++			   frame_head[0], frame_head[1]);
++	} else {
++		/* Standard CAN ID format */
++		id = ((cf->can_id & CAN_SFF_MASK) << CAN_IDR_ID1_SHIFT)
++			& CAN_ID1_MASK;
++
++		if (cf->can_id & CAN_RTR_FLAG)
++			/* Standard frames remote TX request */
++			id |= CAN_ID1_RTR_MASK;
++
++		if (cdev->can.ctrlmode & CAN_CTRLMODE_FD)
++			dlc = (data_len << CANFD_ID1_DLC_OFF)
++				| CANFD_IDR_PAD_MASK;
++		else
++			dlc = (data_len << CAN_ID1_DLC_OFF) | CAN_IDR_PAD_MASK;
++
++		id |= dlc;
++
++		if (cdev->can.ctrlmode & CAN_CTRLMODE_FD) {
++			id |= CAN_ID1_FDF_MASK;
++			if (cf->flags & CANFD_BRS)
++				id |= CANFD_ID1_BRS_MASK;
++			if (cf->flags & CANFD_ESI)
++				id |= CANFD_ID1_ESI_MASK;
++		}
++
++		frame_head[0] =  cpu_to_be32p(&id);
++		/* Write the Frame to Phytium CAN TX FIFO */
++		phytium_can_write(cdev, CAN_TX_FIFO, frame_head[0]);
++		netdev_dbg(dev, "Write atbitration field [0] 0x%x\n",
++			   frame_head[0]);
++	}
++
++	if (!(cf->can_id & CAN_RTR_FLAG)) {
++		netdev_dbg(dev, "Write CAN data frame\n");
++		for (i = 0; i < cf->len; i += 4) {
++			phytium_can_write(cdev, CAN_TX_FIFO,
++					  *(__be32 *)(cf->data + i));
++			netdev_dbg(dev, "[%d]:%x\n", i,
++				   *(__be32 *)(cf->data + i));
++		}
++	}
++
++	stats->tx_bytes += cf->len;
++	stats->tx_packets++;
++
++	cdev->is_tx_done = false;
++	cdev->is_need_stop_xmit = true;
++	mod_timer(&cdev->timer, jiffies + HZ / 10);
++
++	netdev_dbg(dev, "Trigger send message!\n");
++	can_put_echo_skb(skb, dev, 0);
++	can_get_echo_skb(dev, 0);
++	return;
++}
++
++static netdev_tx_t phytium_can_tx_handler(struct phytium_can_dev *cdev)
++{
++	struct net_device *dev = cdev->net;
++	u32 tx_fifo_used;
++	unsigned long flags;
++
++	phytium_can_write_frame(cdev);
++	/* Check if the TX buffer is full */
++	tx_fifo_used = 4 * ((phytium_can_read(cdev, CAN_FIFO_CNT) & FIFO_CNT_TFN) >> 16);
++	if (cdev->can.ctrlmode & CAN_CTRLMODE_FD) {
++		if (CAN_FIFO_BYTE_LEN - tx_fifo_used <= KEEP_CANFD_FIFO_MIN_LEN) {
++			netif_stop_queue(dev);
++			spin_lock_irqsave(&cdev->lock, flags);
++			cdev->is_stop_queue_flag = STOP_QUEUE_TRUE;
++			spin_unlock_irqrestore(&cdev->lock, flags);
++		}
++	} else {
++		if (CAN_FIFO_BYTE_LEN - tx_fifo_used  <= KEEP_CAN_FIFO_MIN_LEN) {
++			netif_stop_queue(dev);
++			spin_lock_irqsave(&cdev->lock, flags);
++			cdev->is_stop_queue_flag = STOP_QUEUE_TRUE;
++			spin_unlock_irqrestore(&cdev->lock, flags);
++		}
++	}
++
++	return NETDEV_TX_OK;
++}
++
++/**
++ * phytium_can_tx_interrupt - Tx Done Isr
++ * @ndev:	net_device pointer
++ * @isr:	Interrupt status register value
++ */
++static void phytium_can_tx_interrupt(struct net_device *ndev, u32 isr)
++{
++	struct phytium_can_dev *cdev = netdev_priv(ndev);
++	struct net_device_stats *stats = &ndev->stats;
++	u32 tx_fifo_used = 0;
++
++	if (isr & INTR_TEIS)
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_TEIC);
++
++	/* Check if the TX buffer is full */
++	if (cdev->is_stop_queue_flag) {
++		tx_fifo_used =  4 * ((phytium_can_read(cdev, CAN_FIFO_CNT) & FIFO_CNT_TFN) >> 16);
++		if (cdev->can.ctrlmode & CAN_CTRLMODE_FD) {
++			if (CAN_FIFO_BYTE_LEN - tx_fifo_used > KEEP_CANFD_FIFO_MIN_LEN) {
++				netif_wake_queue(ndev);
++				cdev->is_stop_queue_flag = STOP_QUEUE_FALSE;
++			}
++		} else {
++			if (CAN_FIFO_BYTE_LEN - tx_fifo_used  > KEEP_CAN_FIFO_MIN_LEN) {
++				netif_wake_queue(ndev);
++				cdev->is_stop_queue_flag = STOP_QUEUE_FALSE;
++			}
++		}
++	}
++
++	cdev->is_tx_done = true;
++	cdev->is_need_stop_xmit = false;
++	del_timer(&cdev->timer);
++
++	netdev_dbg(ndev, "Finish transform packets %lu\n", stats->tx_packets);
++
++
++	phytium_can_set_reg_bits(cdev, CAN_INTR, (INTR_BOIE |
++				 INTR_PWIE | INTR_PEIE));
++
++	can_led_event(ndev, CAN_LED_EVENT_TX);
++
++}
++
++static void phytium_can_tx_done_timeout(struct timer_list *t)
++{
++	struct phytium_can_dev *priv = from_timer(priv, t, timer);
++	struct net_device *ndev = priv->net;
++
++	if (!priv->is_tx_done) {
++		if (priv->is_need_stop_xmit) {
++			netdev_dbg(ndev, "%s stop xmit\n", __func__);
++			priv->is_need_stop_xmit = false;
++			phytium_can_clr_reg_bits(priv, CAN_CTRL, CTRL_XFER);
++			phytium_can_clr_reg_bits(priv, CAN_INTR, (INTR_BOIE |
++						 INTR_PWIE | INTR_PEIE));
++			/* stop xmit and restart after 500ms */
++			mod_timer(&priv->timer, jiffies + HZ / 2);
++		} else {
++			netdev_dbg(ndev, "%s  start xmit\n", __func__);
++			priv->is_need_stop_xmit = true;
++			phytium_can_set_reg_bits(priv, CAN_CTRL, CTRL_XFER);
++			/* start xmit and stop after 250ms */
++			mod_timer(&priv->timer, jiffies + HZ / 4);
++		}
++	}
++}
++
++static void phytium_can_err_interrupt(struct net_device *ndev, u32 isr)
++{
++	struct phytium_can_dev *cdev = netdev_priv(ndev);
++	struct net_device_stats *stats = &ndev->stats;
++	struct can_frame *cf;
++	struct sk_buff *skb;
++	u32  txerr = 0, rxerr = 0;
++
++	skb = alloc_can_err_skb(ndev, &cf);
++
++	rxerr = phytium_can_read(cdev, CAN_ERR_CNT) & ERR_CNT_REC;
++	txerr = ((phytium_can_read(cdev, CAN_ERR_CNT) & ERR_CNT_TEC) >> 16);
++
++	if (isr & INTR_BOIS) {
++		netdev_dbg(ndev, "bus_off %s: txerr :%u rxerr :%u\n",
++			   __func__, txerr, rxerr);
++		cdev->can.state = CAN_STATE_BUS_OFF;
++		cdev->can.can_stats.bus_off++;
++		/* Leave device in Config Mode in bus-off state */
++		phytium_can_write(cdev, CAN_CTRL, CTRL_RST);
++		can_bus_off(ndev);
++		if (skb)
++			cf->can_id |= CAN_ERR_BUSOFF;
++	} else if ((isr & INTR_PEIS) == INTR_PEIS) {
++		netdev_dbg(ndev, "error_passive %s: txerr :%u rxerr :%u\n",
++			   __func__, txerr, rxerr);
++		cdev->can.state = CAN_STATE_ERROR_PASSIVE;
++		cdev->can.can_stats.error_passive++;
++		/* Clear interrupt condition */
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_PEIC);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_PWIC);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_TEIC);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_EIC);
++		if (skb) {
++			cf->can_id |= CAN_ERR_CRTL;
++			cf->data[1] = (rxerr > 127) ?
++					CAN_ERR_CRTL_RX_PASSIVE :
++					CAN_ERR_CRTL_TX_PASSIVE;
++			cf->data[6] = txerr;
++			cf->data[7] = rxerr;
++		}
++	} else if (isr & INTR_PWIS) {
++		netdev_dbg(ndev, "error_warning %s: txerr :%u rxerr :%u\n",
++			   __func__, txerr, rxerr);
++		cdev->can.state = CAN_STATE_ERROR_WARNING;
++		cdev->can.can_stats.error_warning++;
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_PWIC);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_TEIC);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_EIC);
++		if (skb) {
++			cf->can_id |= CAN_ERR_CRTL;
++			cf->data[1] |= (txerr > rxerr) ?
++					CAN_ERR_CRTL_TX_WARNING :
++					CAN_ERR_CRTL_RX_WARNING;
++			cf->data[6] = txerr;
++			cf->data[7] = rxerr;
++		}
++	}
++
++	/* Check for RX FIFO Overflow interrupt */
++	if (isr & INTR_RFIS) {
++		stats->rx_over_errors++;
++		stats->rx_errors++;
++
++		if (skb) {
++			cf->can_id |= CAN_ERR_CRTL;
++			cf->data[1] |= CAN_ERR_CRTL_RX_OVERFLOW;
++		}
++	}
++
++	if (skb) {
++		stats->rx_packets++;
++		stats->rx_bytes += cf->can_dlc;
++		netif_rx(skb);
++	}
++}
++
++/**
++ * phytium_can_isr - CAN Isr
++ * @irq:	irq number
++ * @dev_id:	device id poniter
++ *
++ * This is the phytium CAN Isr. It checks for the type of interrupt
++ * and invokes the corresponding ISR.
++ *
++ * Return:
++ * * IRQ_NONE - If CAN device is in sleep mode, IRQ_HANDLED otherwise
++ */
++static irqreturn_t phytium_can_isr(int irq, void *dev_id)
++{
++	struct net_device *dev = (struct net_device *)dev_id;
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++	u32 isr;
++
++	/* Get the interrupt status */
++	isr = phytium_can_read(cdev, CAN_INTR) & INTR_STATUS_MASK;
++	if (!isr)
++		return IRQ_NONE;
++
++	spin_lock(&cdev->lock);
++	/* Check for FIFO full interrupt and alarm */
++	if ((isr & INTR_RFIS)) {
++		netdev_dbg(dev, "rx_fifo is full!.\n");
++		phytium_can_clr_reg_bits(cdev, CAN_INTR, INTR_RFIE);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_RFIC);
++		napi_schedule(&cdev->napi);
++	}
++
++	/* Check for FIFO empty interrupt and alarm */
++	if ((isr & INTR_TFIS)) {
++		netdev_dbg(dev, "tx_fifo is empty!.\n");
++		isr &= (~INTR_TFIS);
++		phytium_can_clr_reg_bits(cdev, CAN_INTR, INTR_TFIE);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_TFIC);
++	}
++
++	/* Check for the type of error interrupt and Processing it */
++	if (isr & (INTR_EIS | INTR_RFIS | INTR_BOIS | INTR_PWIS | INTR_PEIS)) {
++		phytium_can_clr_reg_bits(cdev, CAN_INTR, (INTR_EIE | INTR_RFIE |
++					 INTR_BOIE | INTR_PWIE | INTR_PEIE));
++		phytium_can_err_interrupt(dev, isr);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, (INTR_EIC | INTR_RFIC |
++					 INTR_BOIC | INTR_PWIC | INTR_PEIC));
++		spin_unlock(&cdev->lock);
++		return IRQ_HANDLED;
++	}
++
++	/* Check for Tx interrupt and Processing it */
++	if ((isr & INTR_TEIS)) {
++		phytium_can_tx_interrupt(dev, isr);
++	}
++
++	/* Check for the type of receive interrupt and Processing it */
++	if (isr & (INTR_REIS)) {
++		phytium_can_clr_reg_bits(cdev, CAN_INTR, INTR_REIE);
++		phytium_can_set_reg_bits(cdev, CAN_INTR, INTR_REIC);
++		napi_schedule(&cdev->napi);
++	}
++	spin_unlock(&cdev->lock);
++	return IRQ_HANDLED;
++}
++
++/**
++ * phytium_can_set_bittiming - CAN set bit timing routine
++ * @dev:	Pointer to net_device structure
++ *
++ * This is the driver set bittiming  routine.
++ * Return: 0 on success and failure value on error
++ */
++static int phytium_can_set_bittiming(struct net_device *dev)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++	const struct can_bittiming *bt = &cdev->can.bittiming;
++	const struct can_bittiming *dbt = &cdev->can.data_bittiming;
++	u32 btr, dbtr;
++	u32 is_config_mode;
++
++	/**
++	 * Check whether Phytium CAN is in configuration mode.
++	 * It cannot set bit timing if Phytium CAN is not in configuration mode.
++	 */
++	is_config_mode = phytium_can_read(cdev, CAN_CTRL) & CTRL_XFER;
++	if (is_config_mode) {
++		netdev_alert(dev, "BUG! Cannot set bittiming - CAN is not in config mode\n");
++		return -EPERM;
++	}
++
++	/* Setting Baud Rate prescalar value in BRPR Register */
++	btr = (bt->brp - 1) << 16;
++
++	/* Setting Time Segment 1 in BTR Register */
++	btr |= (bt->prop_seg - 1) << 2;
++
++	btr |= (bt->phase_seg1 - 1) << 5;
++
++	/* Setting Time Segment 2 in BTR Register */
++	btr |= (bt->phase_seg2 - 1) << 8;
++
++	/* Setting Synchronous jump width in BTR Register */
++	btr |= (bt->sjw - 1);
++
++	dbtr = (dbt->brp - 1) << 16;
++	dbtr |= (dbt->prop_seg - 1) << 2;
++	dbtr |= (dbt->phase_seg1 - 1) << 5;
++	dbtr |= (dbt->phase_seg2 - 1) << 8;
++	dbtr |= (dbt->sjw - 1);
++
++	if (cdev->can.ctrlmode & CAN_CTRLMODE_FD) {
++		phytium_can_write(cdev, CAN_ARB_RATE_CTRL, btr);
++		phytium_can_write(cdev, CAN_DAT_RATE_CTRL, dbtr);
++	} else {
++		phytium_can_write(cdev, CAN_ARB_RATE_CTRL, btr);
++		phytium_can_write(cdev, CAN_DAT_RATE_CTRL, btr);
++	}
++
++	netdev_dbg(dev, "DAT=0x%08x, ARB=0x%08x\n",
++		   phytium_can_read(cdev, CAN_DAT_RATE_CTRL),
++		   phytium_can_read(cdev, CAN_ARB_RATE_CTRL));
++
++	return 0;
++}
++
++/**
++ * phytium_can_start - This the drivers start routine
++ * @dev:	Pointer to net_device structure
++ *
++ * This is the drivers start routine.
++ * Based on the State of the CAN device it puts
++ * the CAN device into a proper mode.
++ *
++ * Return: 0 on success and failure value on error
++ */
++static void phytium_can_start(struct net_device *dev)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++	u32 ctrl;
++
++	/* Disable transfer */
++	ctrl = phytium_can_read(cdev, CAN_CTRL);
++	ctrl &= ~CTRL_XFER;
++	phytium_can_write(cdev, CAN_CTRL, ctrl);
++
++	/* XXX: If CANFD, reset the controller */
++	phytium_can_write(cdev, CAN_CTRL, (ctrl | CTRL_RST));
++
++	/* Bittiming setup */
++	phytium_can_set_bittiming(dev);
++
++	/* Acceptance identifier mask setup */
++	phytium_can_write(cdev, CAN_ACC_ID0_MASK, ACC_IDX_MASK_AID_MASK);
++	phytium_can_write(cdev, CAN_ACC_ID1_MASK, ACC_IDX_MASK_AID_MASK);
++	phytium_can_write(cdev, CAN_ACC_ID2_MASK, ACC_IDX_MASK_AID_MASK);
++	phytium_can_write(cdev, CAN_ACC_ID3_MASK, ACC_IDX_MASK_AID_MASK);
++	ctrl |= CTRL_AIME;
++
++	if (cdev->can.ctrlmode & CAN_CTRLMODE_FD)
++		ctrl |= CTRL_IOF | CTRL_FDCRC;
++
++	phytium_can_write(cdev, CAN_CTRL, ctrl);
++
++	cdev->can.state = CAN_STATE_ERROR_ACTIVE;
++
++	phytium_can_enable_all_interrupts(cdev);
++
++	if (cdev->can.ctrlmode & CAN_CTRLMODE_LISTENONLY)
++		ctrl |= CTRL_XFER;
++	else
++		ctrl |= CTRL_XFER | CTRL_TXREQ;
++
++	phytium_can_write(cdev, CAN_CTRL, ctrl);
++}
++
++/**
++ * phytium_can_stop - Driver stop routine
++ * @dev:	Pointer to net_device structure
++ *
++ * This is the drivers stop routine. It will disable the
++ * interrupts and put the device into configuration mode.
++ */
++static void phytium_can_stop(struct net_device *dev)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++	u32 ctrl;
++
++	/* Disable all interrupts */
++	phytium_can_disable_all_interrupt(cdev);
++
++	/* Disable transfer and switch to receive-only mode */
++	ctrl = phytium_can_read(cdev, CAN_CTRL);
++	ctrl &= ~(CTRL_XFER | CTRL_TXREQ);
++	phytium_can_write(cdev, CAN_CTRL, ctrl);
++
++	del_timer(&cdev->timer);
++
++	/* Set the state as STOPPED */
++	cdev->can.state = CAN_STATE_STOPPED;
++}
++
++static void phytium_can_clean(struct net_device *dev)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++
++	if (cdev->tx_skb) {
++		dev->stats.tx_errors++;
++		can_free_echo_skb(cdev->net, 0);
++		cdev->tx_skb = NULL;
++	}
++}
++
++static int phytium_can_set_mode(struct net_device *dev, enum can_mode mode)
++{
++	switch (mode) {
++	case CAN_MODE_START:
++		phytium_can_clean(dev);
++		phytium_can_start(dev);
++		netif_wake_queue(dev);
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	return 0;
++}
++
++/**
++ * phytium_can_open - Driver open routine
++ * @dev:	Pointer to net_device structure
++ *
++ * This is the driver open routine.
++ * Return: 0 on success and failure value on error
++ */
++static int phytium_can_open(struct net_device *dev)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++	int ret;
++
++	ret = pm_runtime_get_sync(cdev->dev);
++	if (ret < 0) {
++		netdev_err(dev, "%s: pm_runtime_get failed(%d)\n",
++			   __func__, ret);
++		return ret;
++	}
++
++	/* Open the CAN device */
++	ret = open_candev(dev);
++	if (ret) {
++		netdev_err(dev, "failed to open can device\n");
++		goto disable_clk;
++	}
++
++	/* Register interrupt handler */
++	ret = request_irq(dev->irq, phytium_can_isr,
++			  IRQF_SHARED, dev->name, dev);
++	if (ret < 0) {
++		netdev_err(dev, "failed to request interrupt\n");
++		goto fail;
++	}
++
++	/* Start the controller */
++	phytium_can_start(dev);
++
++	netdev_dbg(dev, "%s is going on\n", __func__);
++
++	can_led_event(dev, CAN_LED_EVENT_OPEN);
++	napi_enable(&cdev->napi);
++	cdev->is_stop_queue_flag = STOP_QUEUE_FALSE;
++	netif_start_queue(dev);
++
++	return 0;
++
++fail:
++	pm_runtime_put(cdev->dev);
++	close_candev(dev);
++disable_clk:
++	pm_runtime_put_sync(cdev->dev);
++	return ret;
++}
++
++/**
++ * phytium_can_close - Driver close routine
++ * @dev:	Pointer to net_device structure
++ *
++ * Return: 0 always
++ */
++static int phytium_can_close(struct net_device *dev)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++
++	netif_stop_queue(dev);
++	napi_disable(&cdev->napi);
++
++	phytium_can_stop(dev);
++	free_irq(dev->irq, dev);
++	pm_runtime_put_sync(cdev->dev);
++
++	close_candev(dev);
++	can_led_event(dev, CAN_LED_EVENT_STOP);
++
++	return 0;
++}
++
++/**
++ * phytium_can_start_xmit - Starts the transmission
++ *
++ * Return: 0 on success.
++ */
++static netdev_tx_t phytium_can_start_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++
++	if (can_dropped_invalid_skb(dev, skb))
++		return NETDEV_TX_OK;
++
++	cdev->tx_skb = skb;
++
++	return phytium_can_tx_handler(cdev);
++}
++
++static const struct net_device_ops phytium_can_netdev_ops = {
++	.ndo_open = phytium_can_open,
++	.ndo_stop = phytium_can_close,
++	.ndo_start_xmit = phytium_can_start_xmit,
++	.ndo_change_mtu = can_change_mtu,
++};
++
++static int register_phytium_can_dev(struct net_device *dev)
++{
++	dev->flags |= IFF_ECHO;
++	dev->netdev_ops = &phytium_can_netdev_ops;
++
++	return register_candev(dev);
++}
++
++static int phytium_can_dev_setup(struct phytium_can_dev *cdev)
++{
++	struct net_device *dev = cdev->net;
++
++	netif_napi_add(dev, &cdev->napi, phytium_can_poll, 64);
++
++	cdev->can.do_set_mode = phytium_can_set_mode;
++	cdev->can.do_get_berr_counter = phytium_can_get_berr_counter;
++
++	cdev->can.ctrlmode_supported = CAN_CTRLMODE_LISTENONLY |
++				       CAN_CTRLMODE_BERR_REPORTING;
++	cdev->can.bittiming_const = cdev->bit_timing;
++
++	if (cdev->fdmode) {
++		cdev->can.ctrlmode_supported |= CAN_CTRLMODE_FD;
++		dev->mtu = CANFD_MTU;
++		cdev->can.ctrlmode = CAN_CTRLMODE_FD;
++		cdev->can.data_bittiming_const = cdev->bit_timing;
++	}
++	spin_lock_init(&cdev->lock);
++	return 0;
++}
++
++struct phytium_can_dev *phytium_can_allocate_dev(struct device *dev, int sizeof_priv,
++						 int tx_fifo_depth)
++{
++	struct phytium_can_dev *cdev = NULL;
++	struct net_device *net_dev;
++
++	/* Allocate the can device struct */
++	net_dev = alloc_candev(sizeof_priv, tx_fifo_depth);
++	if (!net_dev) {
++		dev_err(dev, "Failed to allocate CAN device.\n");
++		goto out;
++	}
++
++	cdev = netdev_priv(net_dev);
++	cdev->net = net_dev;
++	cdev->dev = dev;
++	SET_NETDEV_DEV(net_dev, dev);
++
++out:
++	return cdev;
++}
++EXPORT_SYMBOL(phytium_can_allocate_dev);
++
++void phytium_can_free_dev(struct net_device *net)
++{
++	free_candev(net);
++}
++EXPORT_SYMBOL(phytium_can_free_dev);
++
++int phytium_can_register(struct phytium_can_dev *cdev)
++{
++	int ret;
++
++	ret = phytium_can_dev_setup(cdev);
++	if (ret)
++		goto fail;
++
++	ret = register_phytium_can_dev(cdev->net);
++	if (ret) {
++		dev_err(cdev->dev, "registering %s failed (err=%d)\n",
++			cdev->net->name, ret);
++		goto fail;
++	}
++
++	cdev->is_tx_done = true;
++	cdev->is_need_stop_xmit = false;
++	timer_setup(&cdev->timer, phytium_can_tx_done_timeout, 0);
++
++	devm_can_led_init(cdev->net);
++
++	dev_info(cdev->dev, "%s device registered (irq=%d)\n",
++		 KBUILD_MODNAME, cdev->net->irq);
++
++	/* Probe finished
++	 * Stop clocks. They will be reactivated once the device is opened.
++	 */
++	pm_runtime_put_sync(cdev->dev);
++
++	return 0;
++
++fail:
++	pm_runtime_put_sync(cdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL(phytium_can_register);
++
++void phytium_can_unregister(struct phytium_can_dev *cdev)
++{
++	unregister_candev(cdev->net);
++}
++EXPORT_SYMBOL(phytium_can_unregister);
++
++int phytium_can_suspend(struct device *dev)
++{
++	struct net_device *ndev = dev_get_drvdata(dev);
++	struct phytium_can_dev *cdev = netdev_priv(ndev);
++
++	if (netif_running(ndev)) {
++		netif_stop_queue(ndev);
++		netif_device_detach(ndev);
++		phytium_can_stop(ndev);
++		pm_runtime_put_sync(cdev->dev);
++	}
++
++	cdev->can.state = CAN_STATE_SLEEPING;
++
++	return 0;
++}
++EXPORT_SYMBOL(phytium_can_suspend);
++
++int phytium_can_resume(struct device *dev)
++{
++	struct net_device *ndev = dev_get_drvdata(dev);
++	struct phytium_can_dev *cdev = netdev_priv(ndev);
++	int ret;
++
++	cdev->can.state = CAN_STATE_ERROR_ACTIVE;
++
++	if (netif_running(ndev)) {
++		ret = pm_runtime_resume(cdev->dev);
++		if (ret)
++			return ret;
++
++		phytium_can_start(ndev);
++		netif_device_attach(ndev);
++		netif_start_queue(ndev);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(phytium_can_resume);
++
++MODULE_AUTHOR("Cheng Quan <chengquan@phytium.com.cn>");
++MODULE_AUTHOR("Chen Baozi <chenbaozi@phytium.com.cn>");
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("CAN bus driver for Phytium CAN controller");
++
+diff --git a/drivers/net/can/phytium/phytium_can.h b/drivers/net/can/phytium/phytium_can.h
+new file mode 100755
+index 000000000..52bddeddc
+--- /dev/null
++++ b/drivers/net/can/phytium/phytium_can.h
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Phytium CAN controller driver
++ *
++ * Copyright (c) 2021-2024 Phytium Technology Co., Ltd.
++ */
++
++#ifndef _PHYTIUM_CAN_H_
++#define _PHYTIUM_CAN_H_
++
++#include <linux/can/core.h>
++#include <linux/can/dev.h>
++
++#include <linux/device.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/iopoll.h>
++
++#define KEEP_CAN_FIFO_MIN_LEN 16
++#define KEEP_CANFD_FIFO_MIN_LEN	128
++#define CAN_FIFO_BYTE_LEN 256
++#define STOP_QUEUE_TRUE		1
++#define STOP_QUEUE_FALSE	0
++
++enum phytium_can_ip_type {
++	PHYTIUM_CAN = 0,
++	PHYTIUM_CANFD,
++};
++
++struct phytium_can_devtype {
++	enum phytium_can_ip_type cantype;
++	const struct can_bittiming_const *bittiming_const;
++};
++
++struct phytium_can_dev {
++	struct can_priv can;
++
++	struct napi_struct napi;
++	struct net_device *net;
++	struct device *dev;
++	struct clk *clk;
++
++	struct sk_buff *tx_skb;
++
++	const struct can_bittiming_const *bit_timing;
++	spinlock_t lock;		/*spinlock*/
++	int fdmode;
++	u32 isr;
++	u32 tx_fifo_depth;
++	unsigned int is_stop_queue_flag;
++	void __iomem *base;
++
++	struct timer_list	timer;          /* xmit done timer */
++	u32 is_tx_done;
++	u32 is_need_stop_xmit;
++};
++
++struct phytium_can_dev *phytium_can_allocate_dev(struct device *dev, int sizeof_priv,
++						 int tx_fifo_depth);
++void phytium_can_free_dev(struct net_device *net);
++
++int phytium_can_register(struct phytium_can_dev *cdev);
++void phytium_can_unregister(struct phytium_can_dev *cdev);
++
++int phytium_can_suspend(struct device *dev);
++int phytium_can_resume(struct device *dev);
++#endif /* _PHYTIUM_CAN_H_ */
+diff --git a/drivers/net/can/phytium/phytium_can_pci.c b/drivers/net/can/phytium/phytium_can_pci.c
+new file mode 100755
+index 000000000..a41833b7e
+--- /dev/null
++++ b/drivers/net/can/phytium/phytium_can_pci.c
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Platform CAN bus driver for Phytium CAN controller
++ *
++ * Copyright (c) 2021-2024 Phytium Technology Co., Ltd.
++ */
++
++#include <linux/pci.h>
++
++#include "phytium_can.h"
++
++struct phytium_can_pci_config {
++	const struct phytium_can_devtype *devtype;
++	unsigned int clock_freq;
++	unsigned int tx_fifo_depth;
++};
++
++#define cdev2priv(dev) container_of(dev, struct phytium_can_pci, cdev)
++
++struct phytium_can_pci {
++	struct phytium_can_dev cdev;
++
++	void __iomem *base;
++};
++
++static const struct can_bittiming_const phytium_bittiming_const_8192 = {
++	.name = "phytium_can",
++	.tseg1_min = 1,		/* Time segment 1 = prop_seg + phase_seg1 */
++	.tseg1_max = 16,
++	.tseg2_min = 1,		/* Time segment 2 = phase_seg2 */
++	.tseg2_max = 8,
++	.sjw_max = 4,		/* Synchronisation jump width */
++	.brp_min = 1,		/* Bit-rate prescaler */
++	.brp_max = 8192,
++	.brp_inc = 2,
++};
++
++static const struct phytium_can_devtype phytium_can_pci = {
++	.cantype = PHYTIUM_CAN,
++	.bittiming_const = &phytium_bittiming_const_8192,
++};
++
++static const struct phytium_can_pci_config phytium_can_pci_data = {
++	.devtype = &phytium_can_pci,
++	.clock_freq = 480000000,
++	.tx_fifo_depth = 64,
++};
++
++static int phytium_can_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	const struct phytium_can_pci_config *cfg;
++	struct phytium_can_dev *cdev;
++	struct phytium_can_pci *priv;
++	int ret;
++
++	cfg = (const struct phytium_can_pci_config *)id->driver_data;
++
++	ret = pcim_enable_device(pdev);
++	if (ret)
++		goto err;
++
++	ret = pcim_iomap_regions(pdev, 0x1, pci_name(pdev));
++	if (ret)
++		goto err;
++
++	cdev = phytium_can_allocate_dev(&pdev->dev, sizeof(struct phytium_can_pci),
++					cfg->tx_fifo_depth);
++	if (!cdev)
++		return -ENOMEM;
++
++	priv = cdev2priv(cdev);
++	priv->base = pcim_iomap_table(pdev)[0];
++
++	cdev->dev = &pdev->dev;
++	cdev->fdmode = cfg->devtype->cantype;
++	cdev->bit_timing = cfg->devtype->bittiming_const;
++	cdev->can.clock.freq = cfg->clock_freq;
++	cdev->tx_fifo_depth = cfg->tx_fifo_depth;
++
++	cdev->base = priv->base;
++	cdev->net->irq = pdev->irq;
++
++	pci_set_drvdata(pdev, cdev->net);
++
++	if (!pm_runtime_enabled(cdev->dev))
++		pm_runtime_enable(cdev->dev);
++	ret = pm_runtime_get_sync(cdev->dev);
++	if (ret < 0) {
++		netdev_err(cdev->net, "%s: pm_runtime_get failed(%d)\n",
++			   __func__, ret);
++		goto err_pmdisable;
++	}
++	ret = phytium_can_register(cdev);
++	if (ret)
++		goto err;
++
++	return 0;
++
++err_pmdisable:
++	pm_runtime_disable(&pdev->dev);
++err:
++	return ret;
++}
++
++static void phytium_can_pci_remove(struct pci_dev *pdev)
++{
++	struct net_device *dev = pci_get_drvdata(pdev);
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++
++	pm_runtime_disable(cdev->dev);
++
++	phytium_can_unregister(cdev);
++	phytium_can_free_dev(cdev->net);
++}
++
++static __maybe_unused int phytium_can_pci_suspend(struct device *dev)
++{
++	return phytium_can_suspend(dev);
++}
++
++static __maybe_unused int phytium_can_pci_resume(struct device *dev)
++{
++	return phytium_can_resume(dev);
++}
++
++static SIMPLE_DEV_PM_OPS(phytium_can_pci_pm_ops,
++			 phytium_can_pci_suspend, phytium_can_pci_resume);
++
++static const struct pci_device_id phytium_can_pci_id_table[] = {
++	{ PCI_VDEVICE(PHYTIUM, 0xdc2d), (kernel_ulong_t)&phytium_can_pci_data, },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(pci, phytium_can_pci_id_table);
++
++static struct pci_driver phytium_can_pci_driver = {
++	.name = KBUILD_MODNAME,
++	.probe = phytium_can_pci_probe,
++	.remove = phytium_can_pci_remove,
++	.id_table = phytium_can_pci_id_table,
++	.driver = {
++		.pm = &phytium_can_pci_pm_ops,
++	},
++};
++
++module_pci_driver(phytium_can_pci_driver);
++
++MODULE_AUTHOR("Cheng Quan <chengquan@phytium.com.cn");
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Phytium CAN driver for PCI-based controllers");
+diff --git a/drivers/net/can/phytium/phytium_can_platform.c b/drivers/net/can/phytium/phytium_can_platform.c
+new file mode 100755
+index 000000000..35a747ad7
+--- /dev/null
++++ b/drivers/net/can/phytium/phytium_can_platform.c
+@@ -0,0 +1,231 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Platform CAN bus driver for Phytium CAN controller
++ *
++ * Copyright (c) 2021-2024 Phytium Technology Co., Ltd.
++ */
++
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++#include <linux/phy/phy.h>
++
++#include "phytium_can.h"
++
++#define cdev2priv(dev) container_of(dev, struct phytium_can_plat, cdev)
++
++struct phytium_can_plat {
++	struct phytium_can_dev cdev;
++	struct phytium_can_devtype *devtype;
++
++	int irq;
++	void __iomem *reg_base;
++};
++
++static const struct can_bittiming_const phytium_bittiming_const_512 = {
++	.name = "phytium_can",
++	.tseg1_min = 1,		/* Time segment 1 = prop_seg + phase_seg1 */
++	.tseg1_max = 16,
++	.tseg2_min = 1,		/* Time segment 2 = phase_seg2 */
++	.tseg2_max = 8,
++	.sjw_max = 4,		/* Synchronisation jump width */
++	.brp_min = 1,		/* Bit-rate prescaler */
++	.brp_max = 512,
++	.brp_inc = 2,
++};
++
++static const struct can_bittiming_const phytium_bittiming_const_8192 = {
++	.name = "phytium_can",
++	.tseg1_min = 1,		/* Time segment 1 = prop_seg + phase_seg1 */
++	.tseg1_max = 16,
++	.tseg2_min = 1,		/* Time segment 2 = phase_seg2 */
++	.tseg2_max = 8,
++	.sjw_max = 4,		/* Synchronisation jump width */
++	.brp_min = 1,		/* Bit-rate prescaler */
++	.brp_max = 8192,
++	.brp_inc = 2,
++};
++
++static const struct phytium_can_devtype phytium_can_data = {
++	.cantype = PHYTIUM_CAN,
++	.bittiming_const = &phytium_bittiming_const_512,
++};
++
++static const struct phytium_can_devtype phytium_canfd_data = {
++	.cantype = PHYTIUM_CANFD,
++	.bittiming_const = &phytium_bittiming_const_8192,
++};
++
++#ifdef CONFIG_ACPI
++static const struct acpi_device_id phytium_can_acpi_ids[] = {
++	{ "PHYT000A", 0 },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(acpi, phytium_can_acpi_ids);
++#endif
++
++#ifdef CONFIG_OF
++static const struct of_device_id phytium_can_of_ids[] = {
++	{ .compatible = "phytium,can", .data = &phytium_can_data },
++	{ .compatible = "phytium,canfd", .data = &phytium_canfd_data },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(of, phytium_can_of_ids);
++#endif
++
++static int phytium_can_plat_probe(struct platform_device *pdev)
++{
++	struct phytium_can_dev *cdev;
++	struct phytium_can_plat *priv;
++	struct resource *res;
++	const struct of_device_id *of_id;
++	const struct phytium_can_devtype *devtype = &phytium_can_data;
++	u32 tx_fifo_depth;
++	int ret;
++	const char *str = "can";
++
++	ret = fwnode_property_read_u32(dev_fwnode(&pdev->dev), "tx-fifo-depth", &tx_fifo_depth);
++	if (ret)
++		tx_fifo_depth = 64;
++
++	cdev = phytium_can_allocate_dev(&pdev->dev, sizeof(struct phytium_can_plat),
++					tx_fifo_depth);
++	if (!cdev)
++		return -ENOMEM;
++
++	priv = cdev2priv(cdev);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	priv->reg_base = devm_ioremap_resource(&pdev->dev, res);
++	priv->irq = platform_get_irq(pdev, 0);
++	if (IS_ERR(priv->reg_base) || cdev->net->irq < 0) {
++		ret = -EINVAL;
++		goto fail;
++	}
++
++	if (pdev->dev.of_node) {
++		cdev->clk = devm_clk_get(&pdev->dev, "can_clk");
++		if (IS_ERR(cdev->clk)) {
++			dev_err(&pdev->dev, "no clock found\n");
++			ret = -ENODEV;
++			goto fail;
++		}
++		cdev->can.clock.freq = clk_get_rate(cdev->clk);
++
++		of_id = of_match_device(phytium_can_of_ids, &pdev->dev);
++		if (of_id && of_id->data)
++			devtype = of_id->data;
++	} else if (has_acpi_companion(&pdev->dev)) {
++		ret = fwnode_property_read_u32(dev_fwnode(&pdev->dev),
++					       "clock-frequency",
++					       &cdev->can.clock.freq);
++		if (ret < 0) {
++			dev_err(&pdev->dev, "failed to get clock frequency.\n");
++			goto fail;
++		}
++
++		fwnode_property_read_string(dev_fwnode(&pdev->dev),
++					    "mode-select", &str);
++		if (!(strcmp(str, "canfd")))
++			devtype = &phytium_canfd_data;
++	}
++
++	cdev->tx_fifo_depth = tx_fifo_depth;
++
++	if (devtype->cantype == PHYTIUM_CANFD)
++		cdev->fdmode = 1;
++	else
++		cdev->fdmode = 0;
++
++	if (fwnode_property_present(dev_fwnode(&pdev->dev), "extend_brp"))
++		cdev->bit_timing = &phytium_bittiming_const_8192;
++	else
++		cdev->bit_timing = devtype->bittiming_const;
++	cdev->can.bittiming_const = devtype->bittiming_const;
++	cdev->base = priv->reg_base;
++	cdev->net->irq = priv->irq;
++
++	platform_set_drvdata(pdev, cdev->net);
++
++	if (!pm_runtime_enabled(cdev->dev))
++		pm_runtime_enable(cdev->dev);
++	ret = pm_runtime_get_sync(cdev->dev);
++	if (ret < 0) {
++		netdev_err(cdev->net, "%s: pm_runtime_get failed(%d)\n",
++			   __func__, ret);
++		goto out_runtime_disable;
++	}
++
++	ret = phytium_can_register(cdev);
++	if (ret)
++		goto out_runtime_disable;
++
++	return ret;
++
++out_runtime_disable:
++	pm_runtime_disable(cdev->dev);
++fail:
++	phytium_can_free_dev(cdev->net);
++	return ret;
++}
++
++static __maybe_unused int phytium_can_plat_suspend(struct device *dev)
++{
++	return phytium_can_suspend(dev);
++}
++
++static __maybe_unused int phytium_can_plat_resume(struct device *dev)
++{
++	return phytium_can_resume(dev);
++}
++
++static int phytium_can_plat_remove(struct platform_device *pdev)
++{
++	struct net_device *dev = platform_get_drvdata(pdev);
++	struct phytium_can_dev *cdev = netdev_priv(dev);
++
++	phytium_can_unregister(cdev);
++
++	phytium_can_free_dev(cdev->net);
++
++	return 0;
++}
++
++static int __maybe_unused phytium_can_runtime_suspend(struct device *dev)
++{
++	struct net_device *ndev = dev_get_drvdata(dev);
++	struct phytium_can_dev *cdev = netdev_priv(ndev);
++
++	clk_disable_unprepare(cdev->clk);
++
++	return 0;
++}
++
++static int __maybe_unused phytium_can_runtime_resume(struct device *dev)
++{
++	struct net_device *ndev = dev_get_drvdata(dev);
++	struct phytium_can_dev *cdev = netdev_priv(ndev);
++
++	return clk_prepare_enable(cdev->clk);
++}
++
++static const struct dev_pm_ops phytium_can_plat_pm_ops = {
++	SET_RUNTIME_PM_OPS(phytium_can_runtime_suspend,
++			   phytium_can_runtime_resume, NULL)
++	SET_SYSTEM_SLEEP_PM_OPS(phytium_can_suspend, phytium_can_resume)
++};
++
++static struct platform_driver phytium_can_plat_driver = {
++	.driver = {
++		.name = KBUILD_MODNAME,
++		.of_match_table = of_match_ptr(phytium_can_of_ids),
++		.acpi_match_table = ACPI_PTR(phytium_can_acpi_ids),
++		.pm = &phytium_can_plat_pm_ops,
++	},
++	.probe = phytium_can_plat_probe,
++	.remove = phytium_can_plat_remove,
++};
++
++module_platform_driver(phytium_can_plat_driver);
++
++MODULE_AUTHOR("Cheng Quan <chengquan@phytium.com.cn>");
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Phytium CAN driver for IO Mapped controllers");
