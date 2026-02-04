@@ -304,6 +304,7 @@ fix_mars_compile_err.patch
 fix_rtc_compile_err.patch
 d2000_support_gpio_can.patch
 fix_pci_ids_compile_err.patch
+spi-w25q512jv.patch
 
 #
 #
