@@ -305,7 +305,8 @@ fix_rtc_compile_err.patch
 d2000_support_gpio_can.patch
 fix_pci_ids_compile_err.patch
 spi-w25q512jv.patch
-d2000_soc_thermal.patch
+d2000_mailbox.patch
+d2000_firmware_hwmon.patch
 
 #
 #
