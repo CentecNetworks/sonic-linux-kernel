@@ -49,10 +49,9 @@ ORIG_FILE = linux_$(KERNEL_VERSION).orig.tar.xz
 DEBIAN_FILE = linux_$(KERNEL_VERSION)-$(KERNEL_SUBVERSION).debian.tar.xz
 BUILD_DIR=linux-$(KERNEL_VERSION)
 
-BASE_URL = "https://sonicstorage.blob.core.windows.net/debian-security/pool/updates/main/l/linux"
-DSC_FILE_URL = $(BASE_URL)/$(DSC_FILE)
-DEBIAN_FILE_URL = $(BASE_URL)/$(DEBIAN_FILE)
-ORIG_FILE_URL = $(BASE_URL)/$(ORIG_FILE)
+DSC_FILE_URL = "https://snapshot.debian.org/archive/debian-security/20201217T202250Z/pool/updates/main/l/linux/linux_4.9.246-2.dsc"
+DEBIAN_FILE_URL = "https://snapshot.debian.org/archive/debian-security/20201217T202250Z/pool/updates/main/l/linux/linux_4.9.246-2.debian.tar.xz"
+ORIG_FILE_URL = "https://snapshot.debian.org/archive/debian-security/20201216T235350Z/pool/updates/main/l/linux/linux_4.9.246.orig.tar.xz"
 
 $(addprefix $(DEST)/, $(MAIN_TARGET)): $(DEST)/% :
 	# Obtaining the Debian kernel source
